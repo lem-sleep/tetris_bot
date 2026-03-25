@@ -1,0 +1,60 @@
+# =============================================================================
+# TETR.IO Bot Configuration — 1920x1080 Borderless Windowed
+# =============================================================================
+# Calibrated from actual TETR.IO screenshot. Default skin, minimal graphics.
+
+[capture]
+x = 0
+y = 0
+width = 1920
+height = 1080
+target_fps = 60
+
+[vision]
+# Board grid: top-left corner of cell (0,0). Cell size 45px.
+# Verified via edge detection and grid overlay tool.
+board_x = 733
+board_y = 86
+cell_size = 45
+
+# Hold piece: center of the piece displayed in the HOLD box.
+hold_x = 618
+hold_y = 190
+
+# Next queue: center of a representative cell for each preview piece.
+# 5 preview pieces, sampled at x=1310 (center of NEXT box).
+next_positions = [
+    [1310, 218],
+    [1310, 354],
+    [1310, 467],
+    [1310, 603],
+    [1310, 717],
+]
+
+color_tolerance = 40
+
+[ai]
+playstyle = "balanced"   # Options: balanced, aggressive, defensive, tspin
+think_time_ms = 100
+
+[input]
+# Inter-key timing (milliseconds)
+base_delay_ms = 28.0
+jitter_std_ms = 8.0
+key_hold_ms = 18.0
+key_hold_jitter_ms = 5.0
+das_ms = 100.0
+arr_ms = 0.0
+
+# Humanization
+think_pause_chance = 0.12
+think_pause_max_ms = 180.0
+
+# PPS limiter — keeps play speed in human-like range
+pps_target_min = 4.0
+pps_target_max = 6.5
+
+[hotkeys]
+# F9 = Start/Stop (0x78), F10 = Pause/Resume (0x79)
+vk_toggle = 0x78
+vk_pause = 0x79
