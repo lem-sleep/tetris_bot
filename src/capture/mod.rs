@@ -3,11 +3,13 @@
 use anyhow::{Result, Context};
 use dxgi_capture_rs::DXGIManager;
 use crate::config::CaptureConfig;
+use std::sync::Arc;
 
 /// Raw captured frame data (BGRA pixel buffer).
+/// Uses Arc<Vec<u8>> for cheap cloning — the pixel data is shared, not copied.
 #[derive(Clone)]
 pub struct Frame {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -15,13 +17,15 @@ pub struct Frame {
 
 impl Frame {
     /// Get pixel at (x, y) as (R, G, B).
+    #[inline(always)]
     pub fn pixel_rgb(&self, x: u32, y: u32) -> (u8, u8, u8) {
         let offset = (y * self.stride + x * 4) as usize;
-        // BGRA format
-        let b = self.data[offset];
-        let g = self.data[offset + 1];
-        let r = self.data[offset + 2];
-        (r, g, b)
+        unsafe {
+            let b = *self.data.get_unchecked(offset);
+            let g = *self.data.get_unchecked(offset + 1);
+            let r = *self.data.get_unchecked(offset + 2);
+            (r, g, b)
+        }
     }
 
     /// Extract a sub-region of the frame.
@@ -33,7 +37,7 @@ impl Frame {
             data.extend_from_slice(&self.data[src_start..src_end]);
         }
         Frame {
-            data,
+            data: Arc::new(data),
             width: w,
             height: h,
             stride: w * 4,
@@ -49,13 +53,13 @@ pub struct ScreenCapture {
     region_w: u32,
     region_h: u32,
     last_frame: Option<Frame>,
+    /// True if the last grab returned a fresh frame from DXGI (vs cached).
+    pub frame_is_new: bool,
 }
 
 impl ScreenCapture {
     pub fn new(cfg: &CaptureConfig) -> Result<Self> {
-        // Timeout in ms — how long to wait for a new frame from the compositor.
-        // 16ms ≈ 60 FPS, gives us one vsync cycle to grab.
-        let manager = DXGIManager::new(100)
+        let manager = DXGIManager::new(16)
             .context("Failed to initialize DXGI Desktop Duplication")?;
 
         let (screen_w, screen_h) = manager.geometry();
@@ -68,6 +72,7 @@ impl ScreenCapture {
             region_w: cfg.width,
             region_h: cfg.height,
             last_frame: None,
+            frame_is_new: false,
         })
     }
 
@@ -78,7 +83,7 @@ impl ScreenCapture {
             Ok((pixels, (w, h))) => {
                 let stride = w as u32 * 4;
                 let full_frame = Frame {
-                    data: pixels,
+                    data: Arc::new(pixels),
                     width: w as u32,
                     height: h as u32,
                     stride,
@@ -99,10 +104,11 @@ impl ScreenCapture {
                 };
 
                 self.last_frame = Some(frame.clone());
+                self.frame_is_new = true;
                 Ok(frame)
             }
             Err(_) => {
-                // DXGI timeout — screen hasn't changed, reuse last frame
+                self.frame_is_new = false;
                 self.last_frame.clone()
                     .ok_or_else(|| anyhow::anyhow!("No frame captured yet (DXGI timeout on first capture)"))
             }

@@ -40,6 +40,10 @@ pub struct VisionConfig {
 pub struct AiConfig {
     #[serde(default = "default_playstyle")]
     pub playstyle: String,
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: u32,
+    #[serde(default = "default_min_nodes")]
+    pub min_nodes: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,16 +116,18 @@ impl BotConfig {
 fn default_fps() -> u32 { 60 }
 fn default_tolerance() -> u8 { 40 }
 fn default_playstyle() -> String { "balanced".into() }
-fn default_base_delay() -> f64 { 28.0 }
-fn default_jitter() -> f64 { 8.0 }
-fn default_key_hold() -> f64 { 18.0 }
-fn default_key_hold_jitter() -> f64 { 5.0 }
+fn default_max_nodes() -> u32 { 400_000 }
+fn default_min_nodes() -> u32 { 0 }
+fn default_base_delay() -> f64 { 22.0 }
+fn default_jitter() -> f64 { 6.0 }
+fn default_key_hold() -> f64 { 14.0 }
+fn default_key_hold_jitter() -> f64 { 4.0 }
 fn default_das() -> f64 { 100.0 }
 fn default_arr() -> f64 { 0.0 }
-fn default_think_chance() -> f64 { 0.12 }
-fn default_think_max() -> f64 { 180.0 }
-fn default_pps_min() -> f64 { 4.0 }
-fn default_pps_max() -> f64 { 6.5 }
+fn default_think_chance() -> f64 { 0.08 }
+fn default_think_max() -> f64 { 120.0 }
+fn default_pps_min() -> f64 { 4.5 }
+fn default_pps_max() -> f64 { 7.0 }
 
 // Default TETR.IO keybinds
 fn vk_left() -> u16 { 0x25 }       // VK_LEFT

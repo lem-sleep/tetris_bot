@@ -7,7 +7,7 @@ mod config;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 /// Shared state between bot thread and GUI.
@@ -16,9 +16,7 @@ pub struct BotState {
     pub paused: AtomicBool,
     pub pieces_placed: AtomicU64,
     pub status_text: Mutex<String>,
-    /// Rolling PPS calculated from recent piece times.
     pub current_pps: Mutex<f64>,
-    /// Last few piece timestamps for PPS calculation.
     piece_times: Mutex<Vec<std::time::Instant>>,
 }
 
@@ -39,7 +37,6 @@ impl BotState {
         let now = std::time::Instant::now();
         let mut times = self.piece_times.lock().unwrap();
         times.push(now);
-        // Keep only last 20 pieces for rolling PPS
         if times.len() > 20 {
             let excess = times.len() - 20;
             times.drain(..excess);
@@ -67,7 +64,7 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
         Ok(c) => c,
         Err(e) => { state.set_status(&format!("Capture init failed: {e}")); return; }
     };
-    let board_reader = match vision::BoardReader::new(&cfg.vision) {
+    let mut board_reader = match vision::BoardReader::new(&cfg.vision) {
         Ok(b) => b,
         Err(e) => { state.set_status(&format!("Vision init failed: {e}")); return; }
     };
@@ -89,6 +86,7 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
 
     let target_frame_time = std::time::Duration::from_millis(1000 / cfg.capture.target_fps as u64);
     let mut last_board: Option<[[vision::CellColor; 10]; 20]> = None;
+    let mut waiting_for_move = false;
 
     loop {
         let frame_start = std::time::Instant::now();
@@ -100,6 +98,7 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
             if !was_enabled {
                 state.paused.store(false, Ordering::Relaxed);
                 last_board = None;
+                waiting_for_move = false;
                 state.set_status("Running");
                 info!("Bot STARTED");
             } else {
@@ -125,6 +124,20 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
             continue;
         }
 
+        // === Poll for completed AI move (non-blocking) ===
+        if waiting_for_move {
+            if let Some(ai_move) = ai_engine.poll_move() {
+                waiting_for_move = false;
+                debug!("AI move ready: {} inputs", ai_move.inputs.len());
+                if let Err(e) = input_sender.execute_move(&ai_move) {
+                    warn!("Input execution failed: {e}");
+                } else {
+                    state.record_piece();
+                }
+            }
+        }
+
+        // === Capture frame ===
         let frame = match capturer.grab_frame() {
             Ok(f) => f,
             Err(e) => {
@@ -134,6 +147,18 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
             }
         };
 
+        // Skip heavy processing if DXGI returned a cached frame AND
+        // our sentinel pixel check says nothing changed.
+        if !capturer.frame_is_new && !board_reader.is_frame_dirty(&frame) {
+            let elapsed = frame_start.elapsed();
+            if elapsed < target_frame_time {
+                std::thread::sleep(target_frame_time - elapsed);
+            }
+            continue;
+        }
+
+        // === Full vision pass ===
+        let vision_start = std::time::Instant::now();
         let game_state = match board_reader.read_state(&frame) {
             Ok(s) => s,
             Err(e) => {
@@ -142,27 +167,22 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
                 continue;
             }
         };
+        let vision_ms = vision_start.elapsed().as_secs_f64() * 1000.0;
+        debug!("Vision: {vision_ms:.2}ms");
 
         if !game_state.is_active || game_state.current_piece.is_none() {
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         }
 
+        // === Submit to AI if board changed (non-blocking) ===
         let board_changed = last_board.as_ref().map_or(true, |prev| *prev != game_state.board);
 
-        if board_changed {
+        if board_changed && !waiting_for_move {
             last_board = Some(game_state.board);
-
-            match ai_engine.get_move(&game_state) {
-                Ok(ai_move) => {
-                    if let Err(e) = input_sender.execute_move(&ai_move) {
-                        warn!("Input execution failed: {e}");
-                    } else {
-                        state.record_piece();
-                    }
-                }
-                Err(e) => { warn!("AI move failed: {e}"); }
-            }
+            ai_engine.submit(&game_state);
+            waiting_for_move = true;
+            debug!("Submitted new state to AI");
         }
 
         let elapsed = frame_start.elapsed();
@@ -178,7 +198,6 @@ struct BotApp {
 
 impl eframe::App for BotApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        // Repaint continuously so status updates appear
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         let enabled = self.state.enabled.load(Ordering::Relaxed);
@@ -191,7 +210,6 @@ impl eframe::App for BotApp {
             ui.heading("TETR.IO Bot");
             ui.separator();
 
-            // Status with color
             ui.horizontal(|ui| {
                 ui.label("Status:");
                 let (color, text) = if !enabled {
@@ -206,7 +224,6 @@ impl eframe::App for BotApp {
 
             ui.add_space(8.0);
 
-            // Stats
             eframe::egui::Grid::new("stats").num_columns(2).spacing([20.0, 6.0]).show(ui, |ui| {
                 ui.label("Pieces placed:");
                 ui.label(eframe::egui::RichText::new(format!("{pieces}")).strong());
@@ -219,7 +236,6 @@ impl eframe::App for BotApp {
 
             ui.add_space(12.0);
 
-            // Controls
             ui.horizontal(|ui| {
                 if ui.button(if enabled { "Stop (F9)" } else { "Start (F9)" }).clicked() {
                     let was = self.state.enabled.load(Ordering::Relaxed);
@@ -248,7 +264,6 @@ impl eframe::App for BotApp {
             ui.add_space(12.0);
             ui.separator();
 
-            // Hotkey reference
             ui.label(eframe::egui::RichText::new("Hotkeys").size(14.0).strong());
             eframe::egui::Grid::new("hotkeys").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
                 ui.label("F9");
@@ -281,12 +296,10 @@ fn main() -> Result<()> {
     let state = Arc::new(BotState::new());
     let state_clone = Arc::clone(&state);
 
-    // Spawn bot thread
     std::thread::spawn(move || {
         run_bot(state_clone, cfg);
     });
 
-    // Run GUI on main thread
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([320.0, 300.0])

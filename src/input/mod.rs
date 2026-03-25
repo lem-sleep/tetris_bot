@@ -1,7 +1,8 @@
 //! Input simulation module with humanization.
 //!
 //! Sends keyboard inputs via Windows SendInput API with realistic
-//! timing jitter to mimic human play patterns.
+//! timing jitter to mimic human play patterns. Features dynamic PPS
+//! that adjusts based on board complexity.
 
 use anyhow::Result;
 use rand::Rng;
@@ -11,7 +12,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use crate::ai::{AiMove, MoveInput};
 use crate::config::InputConfig;
 
-/// Handles sending keyboard inputs to TETR.IO with humanized timing.
 pub struct InputSender {
     base_delay_ms: f64,
     jitter_std_ms: f64,
@@ -32,12 +32,23 @@ pub struct InputSender {
     vk_hard_drop: u16,
     vk_hold: u16,
 
-    /// Tracks time of last hard drop to enforce PPS limits.
     last_piece_time: std::time::Instant,
+    /// Precomputed scan codes to avoid calling MapVirtualKeyW per keypress.
+    scan_cache: std::collections::HashMap<u16, u16>,
 }
 
 impl InputSender {
     pub fn new(cfg: &InputConfig) -> Result<Self> {
+        let mut scan_cache = std::collections::HashMap::new();
+        // Precompute scan codes for all keybinds
+        for &vk in &[
+            cfg.vk_left, cfg.vk_right, cfg.vk_rotate_cw, cfg.vk_rotate_ccw,
+            cfg.vk_rotate_180, cfg.vk_soft_drop, cfg.vk_hard_drop, cfg.vk_hold,
+        ] {
+            let scan = unsafe { MapVirtualKeyW(vk as u32, MAP_VIRTUAL_KEY_TYPE(0)) } as u16;
+            scan_cache.insert(vk, scan);
+        }
+
         Ok(Self {
             base_delay_ms: cfg.base_delay_ms,
             jitter_std_ms: cfg.jitter_std_ms,
@@ -57,48 +68,54 @@ impl InputSender {
             vk_hard_drop: cfg.vk_hard_drop,
             vk_hold: cfg.vk_hold,
             last_piece_time: std::time::Instant::now(),
+            scan_cache,
         })
     }
 
-    /// Execute a full AI move as a sequence of humanized key presses.
+    /// Execute a full AI move with humanized timing.
+    /// `board_height` (0-20) controls dynamic PPS: low board = faster play.
     pub fn execute_move(&mut self, ai_move: &AiMove) -> Result<()> {
         let mut rng = rand::thread_rng();
 
-        // Enforce PPS limit: wait if we're placing pieces too fast
-        self.enforce_pps_limit(&mut rng);
+        // Dynamic PPS based on board height
+        let height = ai_move.board_height as f64;
+        // Low board (0-6): play at max PPS. High board (15+): slow down.
+        let pressure = (height / 20.0).clamp(0.0, 1.0);
+        let pps_min = self.pps_target_min + (1.0 - pressure) * 1.5; // boost when safe
+        let pps_max = self.pps_target_max + (1.0 - pressure) * 2.0;
+        self.enforce_pps_limit_dynamic(pps_min, pps_max, &mut rng);
 
-        // Optional "thinking" pause — simulates a human studying the board
-        if rng.gen_bool(self.think_pause_chance.clamp(0.0, 1.0)) {
-            let pause = rng.gen_range(20.0..self.think_pause_max_ms);
+        // Thinking pause — less likely when board is low (playing fast)
+        let think_chance = self.think_pause_chance * (0.3 + 0.7 * pressure);
+        if rng.gen_bool(think_chance.clamp(0.0, 1.0)) {
+            let max_pause = self.think_pause_max_ms * (0.4 + 0.6 * pressure);
+            let pause = rng.gen_range(10.0..max_pause.max(15.0));
             self.sleep_ms(pause);
         }
 
         for (i, input) in ai_move.inputs.iter().enumerate() {
             let vk = self.input_to_vk(*input);
 
-            // Simulate DAS behavior for repeated lateral moves
             let is_lateral = matches!(input, MoveInput::Left | MoveInput::Right);
             let prev_same = i > 0 && ai_move.inputs[i - 1] == *input && is_lateral;
 
             if prev_same {
-                // ARR timing for repeated same-direction taps
-                let arr_delay = self.jittered_duration(self.arr_ms.max(5.0), 2.0, &mut rng);
+                let arr_delay = self.jittered_duration(self.arr_ms.max(3.0), 1.5, &mut rng);
                 self.sleep_ms(arr_delay);
             } else if is_lateral && i > 0 && matches!(ai_move.inputs[i - 1], MoveInput::Left | MoveInput::Right) {
-                // Switching direction — add a small extra hesitation
-                let switch_delay = self.jittered_duration(self.base_delay_ms * 1.3, self.jitter_std_ms, &mut rng);
+                let switch_delay = self.jittered_duration(self.base_delay_ms * 1.2, self.jitter_std_ms, &mut rng);
                 self.sleep_ms(switch_delay);
             }
 
-            // Press key
             self.send_key_down(vk)?;
             let hold = self.jittered_duration(self.key_hold_ms, self.key_hold_jitter_ms, &mut rng);
             self.sleep_ms(hold);
             self.send_key_up(vk)?;
 
-            // Inter-key delay (skip after last input)
             if i + 1 < ai_move.inputs.len() {
-                let delay = self.jittered_duration(self.base_delay_ms, self.jitter_std_ms, &mut rng);
+                // Slightly faster inter-key when board is low
+                let speed_factor = 1.0 - (1.0 - pressure) * 0.25;
+                let delay = self.jittered_duration(self.base_delay_ms * speed_factor, self.jitter_std_ms, &mut rng);
                 self.sleep_ms(delay);
             }
         }
@@ -107,15 +124,12 @@ impl InputSender {
         Ok(())
     }
 
-    /// Wait if needed to keep PPS within the target human-like range.
-    fn enforce_pps_limit(&self, rng: &mut impl Rng) {
-        let target_pps = rng.gen_range(self.pps_target_min..self.pps_target_max);
+    fn enforce_pps_limit_dynamic(&self, pps_min: f64, pps_max: f64, rng: &mut impl Rng) {
+        let target_pps = rng.gen_range(pps_min..pps_max.max(pps_min + 0.1));
         let min_interval_ms = 1000.0 / target_pps;
         let elapsed_ms = self.last_piece_time.elapsed().as_secs_f64() * 1000.0;
-
         if elapsed_ms < min_interval_ms {
-            let wait = min_interval_ms - elapsed_ms;
-            self.sleep_ms(wait);
+            self.sleep_ms(min_interval_ms - elapsed_ms);
         }
     }
 
@@ -144,9 +158,8 @@ impl InputSender {
         std::thread::sleep(std::time::Duration::from_micros((ms * 1000.0) as u64));
     }
 
-    /// Send a key-down event via Windows SendInput.
     fn send_key_down(&self, vk: u16) -> Result<()> {
-        let scan = unsafe { MapVirtualKeyW(vk as u32, MAP_VIRTUAL_KEY_TYPE(0)) } as u16;
+        let scan = self.scan_cache.get(&vk).copied().unwrap_or(0);
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -166,9 +179,8 @@ impl InputSender {
         Ok(())
     }
 
-    /// Send a key-up event via Windows SendInput.
     fn send_key_up(&self, vk: u16) -> Result<()> {
-        let scan = unsafe { MapVirtualKeyW(vk as u32, MAP_VIRTUAL_KEY_TYPE(0)) } as u16;
+        let scan = self.scan_cache.get(&vk).copied().unwrap_or(0);
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {

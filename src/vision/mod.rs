@@ -1,46 +1,74 @@
 //! Board reading / computer vision module.
 //!
 //! Extracts the full game state from a captured frame by sampling pixel colors
-//! at known grid positions and classifying them via HSV hue ranges.
-//! Calibrated for TETR.IO default skin at 1920x1080 with minimal graphics.
+//! at known grid positions. Uses a precomputed RGB→CellColor lookup table for
+//! O(1) classification instead of per-pixel HSV float math.
 
 use anyhow::Result;
 use crate::capture::Frame;
 use crate::config::VisionConfig;
 
 /// The 7 standard Tetris pieces + empty + garbage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum CellColor {
-    Empty,
-    I, // Cyan  (hue ~158-180)
-    O, // Yellow (hue ~46-70)
-    T, // Purple (hue ~240-280)
-    S, // Green  (hue ~75-145)
-    Z, // Red    (hue ~345-15)
-    J, // Blue   (hue ~210-240)
-    L, // Orange (hue ~16-45)
-    Garbage, // Gray (low saturation)
+    Empty = 0,
+    I = 1,
+    O = 2,
+    T = 3,
+    S = 4,
+    Z = 5,
+    J = 6,
+    L = 7,
+    Garbage = 8,
 }
 
 /// Full game state extracted from a single frame.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct GameState {
-    /// 10x20 board grid, row 0 = top.
     pub board: [[CellColor; 10]; 20],
-    /// Currently active piece (falling) — detected from the top rows of the board.
     pub current_piece: Option<CellColor>,
-    /// Piece in hold slot.
     pub hold_piece: Option<CellColor>,
-    /// Next queue (up to 5 pieces).
     pub next_queue: Vec<CellColor>,
-    /// Whether the game appears to be actively running.
     pub is_active: bool,
-    /// Incoming garbage lines (if detectable).
     pub incoming_garbage: u32,
 }
 
+/// Precomputed RGB → CellColor lookup table.
+/// Indexed by (r >> 2, g >> 2, b >> 2) → 64×64×64 = 262,144 entries.
+/// Fits in ~256KB — well within L2 cache.
+struct ColorLut {
+    table: Vec<CellColor>,
+}
+
+impl ColorLut {
+    fn new() -> Self {
+        let mut table = vec![CellColor::Empty; 64 * 64 * 64];
+        for ri in 0..64u32 {
+            for gi in 0..64u32 {
+                for bi in 0..64u32 {
+                    // Map back to approximate RGB (center of the 4-value bin)
+                    let r = (ri * 4 + 2) as u8;
+                    let g = (gi * 4 + 2) as u8;
+                    let b = (bi * 4 + 2) as u8;
+                    let idx = (ri * 64 * 64 + gi * 64 + bi) as usize;
+                    table[idx] = classify_color_slow(r, g, b);
+                }
+            }
+        }
+        Self { table }
+    }
+
+    #[inline(always)]
+    fn classify(&self, r: u8, g: u8, b: u8) -> CellColor {
+        let idx = ((r as usize) >> 2) * 4096 + ((g as usize) >> 2) * 64 + ((b as usize) >> 2);
+        unsafe { *self.table.get_unchecked(idx) }
+    }
+}
+
 /// Reads game state from captured frames.
+#[allow(dead_code)]
 pub struct BoardReader {
     board_x: u32,
     board_y: u32,
@@ -48,10 +76,46 @@ pub struct BoardReader {
     hold_x: u32,
     hold_y: u32,
     next_positions: Vec<(u32, u32)>,
+    lut: ColorLut,
+    /// Precomputed pixel coordinates for each board cell center (row, col) → (px, py).
+    cell_coords: [(u32, u32); 200],
+    /// Sentinel pixels for fast dirty detection — sample a few key positions.
+    /// If these haven't changed, skip the full board read.
+    sentinel_coords: Vec<(u32, u32)>,
+    last_sentinel_colors: Vec<(u8, u8, u8)>,
 }
 
 impl BoardReader {
     pub fn new(cfg: &VisionConfig) -> Result<Self> {
+        let lut = ColorLut::new();
+
+        // Precompute all 200 cell center coordinates
+        let mut cell_coords = [(0u32, 0u32); 200];
+        for row in 0..20u32 {
+            for col in 0..10u32 {
+                let px = cfg.board_x + col * cfg.cell_size + cfg.cell_size / 2;
+                let py = cfg.board_y + row * cfg.cell_size + cfg.cell_size / 2;
+                cell_coords[(row * 10 + col) as usize] = (px, py);
+            }
+        }
+
+        // Sentinel pixels: sample corners + center + next queue first slot.
+        // These change when pieces lock, lines clear, or a new piece spawns.
+        let sentinels = vec![
+            cell_coords[4 * 10 + 5],   // row 4, col 5 (spawn area center)
+            cell_coords[0 * 10 + 4],   // row 0, col 4 (top center)
+            cell_coords[19 * 10 + 0],  // row 19, col 0 (bottom-left)
+            cell_coords[19 * 10 + 9],  // row 19, col 9 (bottom-right)
+            cell_coords[10 * 10 + 5],  // row 10, col 5 (mid center)
+            cell_coords[15 * 10 + 3],  // row 15, col 3 (lower area)
+            (cfg.hold_x, cfg.hold_y),  // hold piece
+        ];
+        // Add first next queue position if available
+        let mut all_sentinels = sentinels;
+        if let Some(&(nx, ny)) = cfg.next_positions.first() {
+            all_sentinels.push((nx, ny));
+        }
+
         Ok(Self {
             board_x: cfg.board_x,
             board_y: cfg.board_y,
@@ -59,7 +123,31 @@ impl BoardReader {
             hold_x: cfg.hold_x,
             hold_y: cfg.hold_y,
             next_positions: cfg.next_positions.clone(),
+            lut,
+            cell_coords,
+            sentinel_coords: all_sentinels,
+            last_sentinel_colors: Vec::new(),
         })
+    }
+
+    /// Quick check: have the sentinel pixels changed since last frame?
+    /// Returns true if the frame looks different (needs full read).
+    pub fn is_frame_dirty(&mut self, frame: &Frame) -> bool {
+        let current: Vec<(u8, u8, u8)> = self.sentinel_coords.iter()
+            .map(|&(x, y)| {
+                if x < frame.width && y < frame.height {
+                    frame.pixel_rgb(x, y)
+                } else {
+                    (0, 0, 0)
+                }
+            })
+            .collect();
+
+        if current == self.last_sentinel_colors {
+            return false;
+        }
+        self.last_sentinel_colors = current;
+        true
     }
 
     /// Read the full game state from a captured frame.
@@ -80,27 +168,22 @@ impl BoardReader {
         })
     }
 
-    /// Sample the 10x20 board grid.
+    /// Sample the 10x20 board grid using precomputed coordinates + LUT.
     fn read_board(&self, frame: &Frame) -> [[CellColor; 10]; 20] {
         let mut board = [[CellColor::Empty; 10]; 20];
-        for row in 0..20u32 {
-            for col in 0..10u32 {
-                let px = self.board_x + col * self.cell_size + self.cell_size / 2;
-                let py = self.board_y + row * self.cell_size + self.cell_size / 2;
+        for row in 0..20 {
+            for col in 0..10 {
+                let (px, py) = self.cell_coords[row * 10 + col];
                 if px < frame.width && py < frame.height {
                     let (r, g, b) = frame.pixel_rgb(px, py);
-                    board[row as usize][col as usize] = classify_color(r, g, b);
+                    board[row][col] = self.lut.classify(r, g, b);
                 }
             }
         }
         board
     }
 
-    /// Detect the currently falling piece by finding colored cells in the top rows
-    /// that form a connected piece shape (not yet locked).
     fn detect_current_piece(&self, board: &[[CellColor; 10]; 20]) -> Option<CellColor> {
-        // Scan from top — the first non-empty, non-garbage color found in the
-        // upper portion of the board is likely the active piece.
         for row in 0..10 {
             for col in 0..10 {
                 let c = board[row][col];
@@ -115,7 +198,7 @@ impl BoardReader {
     fn read_single_piece(&self, frame: &Frame, x: u32, y: u32) -> Option<CellColor> {
         if x < frame.width && y < frame.height {
             let (r, g, b) = frame.pixel_rgb(x, y);
-            let color = classify_color(r, g, b);
+            let color = self.lut.classify(r, g, b);
             if color != CellColor::Empty {
                 return Some(color);
             }
@@ -130,12 +213,7 @@ impl BoardReader {
             .collect()
     }
 
-    /// Detect if a game is active by checking that the board border region
-    /// has some non-black pixels (the white border is visible during gameplay).
     fn detect_game_active(&self, board: &[[CellColor; 10]; 20]) -> bool {
-        // Simple heuristic: if the bottom 4 rows have any non-empty cells,
-        // a game is probably in progress. If the entire board is empty,
-        // we might be in a menu.
         for row in 16..20 {
             for col in 0..10 {
                 if board[row][col] != CellColor::Empty {
@@ -147,34 +225,18 @@ impl BoardReader {
     }
 }
 
-/// Classify an RGB pixel to a piece color using HSV hue ranges.
-/// Calibrated from actual TETR.IO default skin pixel samples.
-pub fn classify_color(r: u8, g: u8, b: u8) -> CellColor {
+/// Original HSV-based classification — used only at startup to build the LUT.
+fn classify_color_slow(r: u8, g: u8, b: u8) -> CellColor {
     let brightness = (r as u16 + g as u16 + b as u16) / 3;
-
-    // Too dark → empty cell
     if brightness < 30 {
         return CellColor::Empty;
     }
 
     let (h, s, _v) = rgb_to_hsv(r, g, b);
 
-    // Low saturation → garbage (gray) or empty
     if s < 0.20 {
         return if brightness > 70 { CellColor::Garbage } else { CellColor::Empty };
     }
-
-    // Classify by hue angle (calibrated from TETR.IO default skin samples):
-    //   Z (Red):    hue 345-360, 0-15     sample: HSV(357, 0.67, 0.76)
-    //   L (Orange): hue 16-45             sample: HSV(23, 0.68, 0.75)
-    //   O (Yellow): hue 46-75             sample: HSV(~55, high sat)
-    //   S (Green):  hue 76-150            sample: HSV(82, 0.68, 0.71-0.75)
-    //   I (Cyan):   hue 151-195           sample: HSV(158, 0.71, 0.71)
-    //   J (Blue):   hue 196-255           sample: HSV(252, 0.38, 0.75)
-    //   T (Purple): hue 256-344           sample: HSV(252, 0.38, 0.75) — J/T overlap
-    //
-    // J vs T distinction: J is more blue (hue 220-250), T is more purple (hue 250-330)
-    // From actual samples: J=HSV(252, 0.38, 0.75), T has higher saturation & more red
 
     match h as u32 {
         0..=15 | 345..=360 => CellColor::Z,

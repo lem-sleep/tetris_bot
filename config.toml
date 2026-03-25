@@ -35,24 +35,26 @@ color_tolerance = 40
 
 [ai]
 playstyle = "balanced"   # Options: balanced, aggressive, defensive, tspin
-think_time_ms = 100
+max_nodes = 400000       # More nodes = stronger but slower (default 400k, was 200k)
+min_nodes = 0
 
 [input]
-# Inter-key timing (milliseconds)
-base_delay_ms = 28.0
-jitter_std_ms = 8.0
-key_hold_ms = 18.0
-key_hold_jitter_ms = 5.0
+# Inter-key timing (milliseconds) — tightened for faster play
+base_delay_ms = 22.0
+jitter_std_ms = 6.0
+key_hold_ms = 14.0
+key_hold_jitter_ms = 4.0
 das_ms = 100.0
 arr_ms = 0.0
 
-# Humanization
-think_pause_chance = 0.12
-think_pause_max_ms = 180.0
+# Humanization — reduced for snappier response
+think_pause_chance = 0.08
+think_pause_max_ms = 120.0
 
-# PPS limiter — keeps play speed in human-like range
-pps_target_min = 4.0
-pps_target_max = 6.5
+# Dynamic PPS limiter — base range, actual PPS adapts to board height
+# Low board: +1.5 to min, +2.0 to max. High board: uses these values.
+pps_target_min = 4.5
+pps_target_max = 7.0
 
 [hotkeys]
 # F9 = Start/Stop (0x78), F10 = Pause/Resume (0x79)
