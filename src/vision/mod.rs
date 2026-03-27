@@ -184,7 +184,9 @@ impl BoardReader {
     }
 
     fn detect_current_piece(&self, board: &[[CellColor; 10]; 20]) -> Option<CellColor> {
-        for row in 0..10 {
+        // The falling piece is typically the topmost colored cells on the board.
+        // Scan from top to bottom — the first piece-colored cell is likely the falling piece.
+        for row in 0..20 {
             for col in 0..10 {
                 let c = board[row][col];
                 if c != CellColor::Empty && c != CellColor::Garbage {
@@ -214,10 +216,17 @@ impl BoardReader {
     }
 
     fn detect_game_active(&self, board: &[[CellColor; 10]; 20]) -> bool {
-        for row in 16..20 {
+        // Game is active if there are any non-empty cells on the board.
+        // The falling piece counts — if we see ANY piece, the game is running.
+        let mut filled = 0u32;
+        for row in 0..20 {
             for col in 0..10 {
                 if board[row][col] != CellColor::Empty {
-                    return true;
+                    filled += 1;
+                    // Need at least 4 filled cells (one tetromino) to be confident
+                    if filled >= 4 {
+                        return true;
+                    }
                 }
             }
         }

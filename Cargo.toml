@@ -2,7 +2,8 @@
 name = "tetris_bot"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance TETR.IO bot using screen capture and Cold Clear AI"
+description = "TETR.IO ESP overlay — shows Cold Clear AI recommended placement as a ghost piece"
+default-run = "tetris_bot"
 
 [dependencies]
 # Screen capture — DXGI Desktop Duplication wrapper (actively maintained, zero-copy)
@@ -27,10 +28,6 @@ toml = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Randomness for humanization
-rand = "0.8"
-rand_distr = "0.4"
 
 # Image encoding (for calibration screenshot saving)
 image = "0.25"

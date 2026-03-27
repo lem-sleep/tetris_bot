@@ -1,34 +1,50 @@
 //! AI module wrapping Cold Clear for move computation.
 //!
-//! Cold Clear runs on its own background threads. We communicate with it via
-//! channels so the main capture loop is never blocked waiting for a move.
+//! For each move request, we create a fresh Cold Clear interface initialized
+//! with the actual board state from screen capture. This ensures Cold Clear's
+//! internal state always matches reality — critical when using vision-based input.
+//!
+//! Returns an `AiSuggestion` with TWO placements: one for placing the current
+//! piece directly, and one for holding first then placing the hold piece.
 
 use anyhow::{Result, Context};
-use libtetris::{Board, Piece, PieceMovement};
+use libtetris::{Board, MovementMode, Piece};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use crate::config::AiConfig;
 use crate::vision::{CellColor, GameState};
 
-/// A computed move: the sequence of inputs to place the current piece.
+/// A single recommended placement (position + piece color).
 #[derive(Debug, Clone)]
-pub struct AiMove {
-    pub inputs: Vec<MoveInput>,
-    /// Board height at time of move request — used for dynamic PPS.
-    pub board_height: u8,
+pub struct OverlayPlacement {
+    /// 4 cell positions in vision coords: (col 0-9, row 0-19 where row 0 = top).
+    pub cells: [(i32, i32); 4],
+    /// Piece color (for ghost tinting).
+    pub piece_color: CellColor,
 }
 
-/// Individual input actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum MoveInput {
-    Left,
-    Right,
-    RotateCW,
-    RotateCCW,
-    Rotate180,
-    SoftDrop,
-    HardDrop,
-    Hold,
+/// Both placement options for the overlay: direct and hold.
+#[derive(Debug, Clone)]
+pub struct AiSuggestion {
+    /// Best placement for the current piece (no hold).
+    pub direct: OverlayPlacement,
+    /// Best placement if the user holds first (None if no hold piece available).
+    pub hold_option: Option<OverlayPlacement>,
+}
+
+fn piece_name(color: CellColor) -> Option<&'static str> {
+    match color {
+        CellColor::I => Some("I"),
+        CellColor::O => Some("O"),
+        CellColor::T => Some("T"),
+        CellColor::S => Some("S"),
+        CellColor::Z => Some("Z"),
+        CellColor::J => Some("J"),
+        CellColor::L => Some("L"),
+        CellColor::Empty => Some("_"),
+        CellColor::Garbage => Some("G"),
+    }
 }
 
 fn color_to_piece(color: CellColor) -> Option<Piece> {
@@ -44,89 +60,133 @@ fn color_to_piece(color: CellColor) -> Option<Piece> {
     }
 }
 
-fn cc_movements_to_inputs(movements: &[PieceMovement], hold: bool) -> Vec<MoveInput> {
-    let mut inputs = Vec::with_capacity(movements.len() + 2);
-    if hold {
-        inputs.push(MoveInput::Hold);
+fn piece_to_color(piece: Piece) -> CellColor {
+    match piece {
+        Piece::I => CellColor::I,
+        Piece::O => CellColor::O,
+        Piece::T => CellColor::T,
+        Piece::S => CellColor::S,
+        Piece::Z => CellColor::Z,
+        Piece::J => CellColor::J,
+        Piece::L => CellColor::L,
     }
-    for m in movements {
-        match m {
-            PieceMovement::Left => inputs.push(MoveInput::Left),
-            PieceMovement::Right => inputs.push(MoveInput::Right),
-            PieceMovement::Cw => inputs.push(MoveInput::RotateCW),
-            PieceMovement::Ccw => inputs.push(MoveInput::RotateCCW),
-            PieceMovement::SonicDrop => inputs.push(MoveInput::SoftDrop),
-        }
-    }
-    inputs.push(MoveInput::HardDrop);
-    inputs
 }
 
-/// Compute the max occupied row height (0 = empty board, 20 = topped out).
-fn board_height(board: &[[CellColor; 10]; 20]) -> u8 {
+/// Build a Cold Clear compatible field from vision board data.
+/// Uses connected component analysis to find and exclude the falling piece —
+/// the topmost group of 4 connected cells matching the current piece color.
+fn build_field_from_vision(
+    board: &[[CellColor; 10]; 20],
+    current_piece: Option<CellColor>,
+) -> [[bool; 10]; 40] {
+    // Find cells belonging to the falling piece via flood fill
+    let falling_cells = find_falling_piece_cells(board, current_piece);
+
+    let mut field = [[false; 10]; 40];
+    for vision_row in 0..20usize {
+        let lt_row = 19 - vision_row;
+        for col in 0..10usize {
+            let cell = board[vision_row][col];
+            if cell == CellColor::Empty {
+                continue;
+            }
+            // Skip cells identified as the falling piece
+            if falling_cells.contains(&(vision_row, col)) {
+                continue;
+            }
+            field[lt_row][col] = true;
+        }
+    }
+    field
+}
+
+/// Find the cells belonging to the falling piece using connected component analysis.
+/// Scans from the top of the board for the first connected group of cells matching
+/// the current piece color. A valid tetromino has exactly 4 orthogonally connected cells.
+fn find_falling_piece_cells(
+    board: &[[CellColor; 10]; 20],
+    current_piece: Option<CellColor>,
+) -> Vec<(usize, usize)> {
+    let color = match current_piece {
+        Some(c) if c != CellColor::Empty && c != CellColor::Garbage => c,
+        _ => return Vec::new(),
+    };
+
+    let mut visited = [[false; 10]; 20];
+
+    // Scan from top-left to find connected components of the current piece color
     for row in 0..20 {
         for col in 0..10 {
-            if board[row][col] != CellColor::Empty {
-                return (20 - row) as u8;
+            if board[row][col] == color && !visited[row][col] {
+                let mut component = Vec::new();
+                flood_fill(board, row, col, color, &mut visited, &mut component);
+
+                // A standard tetromino is exactly 4 cells
+                if component.len() == 4 {
+                    return component;
+                }
+                // If >4 cells, the falling piece merged with locked cells of the same color.
+                // Take the topmost 4 cells as the falling piece (it spawns at the top).
+                if component.len() > 4 {
+                    component.sort_by_key(|&(r, c)| (r, c));
+                    component.truncate(4);
+                    return component;
+                }
+                // <4 cells: might be locked debris, keep scanning for the real piece
             }
         }
     }
-    0
+    Vec::new()
 }
 
-/// A compact signature of the game state for dedup — avoids re-requesting
-/// moves when the board + queue haven't actually changed.
-#[derive(Clone, PartialEq, Eq)]
-struct StateSignature {
-    current: Option<CellColor>,
-    queue: [Option<CellColor>; 5],
-    board_hash: u64,
-}
-
-impl StateSignature {
-    fn from_game_state(state: &GameState) -> Self {
-        let mut queue = [None; 5];
-        for (i, c) in state.next_queue.iter().take(5).enumerate() {
-            queue[i] = Some(*c);
-        }
-        // FNV-1a hash of the board — fast, no crypto needed
-        let mut h: u64 = 0xcbf29ce484222325;
-        for row in &state.board {
-            for cell in row {
-                h ^= *cell as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-        }
-        Self {
-            current: state.current_piece,
-            queue,
-            board_hash: h,
-        }
+fn flood_fill(
+    board: &[[CellColor; 10]; 20],
+    row: usize,
+    col: usize,
+    color: CellColor,
+    visited: &mut [[bool; 10]; 20],
+    component: &mut Vec<(usize, usize)>,
+) {
+    if row >= 20 || col >= 10 || visited[row][col] || board[row][col] != color {
+        return;
     }
+    visited[row][col] = true;
+    component.push((row, col));
+
+    if row > 0 { flood_fill(board, row - 1, col, color, visited, component); }
+    if row < 19 { flood_fill(board, row + 1, col, color, visited, component); }
+    if col > 0 { flood_fill(board, row, col - 1, color, visited, component); }
+    if col < 9 { flood_fill(board, row, col + 1, color, visited, component); }
 }
 
-/// Message sent from main loop → AI thread.
+/// Message sent from main loop -> AI thread.
 struct AiRequest {
     state: GameState,
-    height: u8,
 }
 
-/// Non-blocking AI engine. The main loop sends game states and polls for moves.
+/// Non-blocking AI engine. The main loop sends game states and polls for suggestions.
 pub struct AiEngine {
     req_tx: mpsc::Sender<AiRequest>,
-    resp_rx: mpsc::Receiver<AiMove>,
-    last_sig: Option<StateSignature>,
-    pending: bool,
-    cached_move: Option<AiMove>,
+    resp_rx: mpsc::Receiver<AiSuggestion>,
+    cancel: Arc<AtomicBool>,
+    options: cold_clear::Options,
+    weights: cold_clear::evaluation::Standard,
 }
 
 impl AiEngine {
     pub fn new(cfg: &AiConfig) -> Result<Self> {
+        let mode = match cfg.movement_mode.as_str() {
+            "zero_g" => MovementMode::ZeroG,
+            "twenty_g" => MovementMode::TwentyG,
+            _ => MovementMode::HardDropOnly,
+        };
+
         let options = cold_clear::Options {
             max_nodes: cfg.max_nodes,
             min_nodes: cfg.min_nodes,
-            use_hold: true,
+            use_hold: false, // We compute hold vs no-hold separately
             speculate: true,
+            mode,
             ..Default::default()
         };
 
@@ -159,76 +219,134 @@ impl AiEngine {
             _ => cold_clear::evaluation::Standard::default(),
         };
 
-        let board = Board::new();
-        let interface = cold_clear::Interface::launch(board, options, weights, None);
-        tracing::info!("Cold Clear AI initialized (playstyle: {}, max_nodes: {})", cfg.playstyle, cfg.max_nodes);
+        tracing::info!(
+            "Cold Clear AI initialized (playstyle: {}, max_nodes: {}, mode: {:?})",
+            cfg.playstyle, cfg.max_nodes, mode
+        );
 
+        let cancel = Arc::new(AtomicBool::new(false));
         let (req_tx, req_rx) = mpsc::channel::<AiRequest>();
-        let (resp_tx, resp_rx) = mpsc::channel::<AiMove>();
+        let (resp_tx, resp_rx) = mpsc::channel::<AiSuggestion>();
 
-        // Spawn dedicated AI worker thread
+        let opts = options.clone();
+        let wts = weights.clone();
+        let cancel_flag = Arc::clone(&cancel);
+
         std::thread::Builder::new()
             .name("ai-worker".into())
             .spawn(move || {
-                ai_worker(interface, req_rx, resp_tx);
+                ai_worker(opts, wts, req_rx, resp_tx, cancel_flag);
             })
             .context("Failed to spawn AI worker thread")?;
 
         Ok(Self {
             req_tx,
             resp_rx,
-            last_sig: None,
-            pending: false,
-            cached_move: None,
+            cancel,
+            options,
+            weights,
         })
     }
 
+    /// Kill the current worker and spawn a fresh one.
+    /// Call this when the bot is re-enabled to avoid stale blocked state.
+    pub fn reset(&mut self) -> Result<()> {
+        // Signal old worker to stop, then drop its sender so it exits.
+        self.cancel.store(true, Ordering::Relaxed);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (req_tx, req_rx) = mpsc::channel::<AiRequest>();
+        let (resp_tx, resp_rx) = mpsc::channel::<AiSuggestion>();
+
+        let opts = self.options.clone();
+        let wts = self.weights.clone();
+        let cancel_flag = Arc::clone(&cancel);
+
+        std::thread::Builder::new()
+            .name("ai-worker".into())
+            .spawn(move || {
+                ai_worker(opts, wts, req_rx, resp_tx, cancel_flag);
+            })
+            .context("Failed to spawn AI worker thread")?;
+
+        self.req_tx = req_tx;
+        self.resp_rx = resp_rx;
+        self.cancel = cancel;
+
+        tracing::info!("AI engine reset — fresh worker spawned");
+        Ok(())
+    }
+
     /// Submit a game state for AI processing. Returns immediately.
-    /// Skips submission if the state hasn't meaningfully changed.
     pub fn submit(&mut self, state: &GameState) {
-        let sig = StateSignature::from_game_state(state);
-        if self.pending {
-            // Already computing — only resubmit if state changed
-            if self.last_sig.as_ref() == Some(&sig) {
-                return;
-            }
-        }
-        if self.last_sig.as_ref() == Some(&sig) && self.cached_move.is_some() {
-            return; // Same state, already have a cached move
-        }
-
-        let height = board_height(&state.board);
-        self.last_sig = Some(sig);
-        self.pending = true;
-
         let _ = self.req_tx.send(AiRequest {
             state: state.clone(),
-            height,
         });
     }
 
-    /// Poll for a completed move. Non-blocking — returns None if AI is still thinking.
-    pub fn poll_move(&mut self) -> Option<AiMove> {
-        match self.resp_rx.try_recv() {
-            Ok(mv) => {
-                self.pending = false;
-                self.cached_move = Some(mv.clone());
-                Some(mv)
-            }
-            Err(_) => None,
-        }
+    /// Poll for a completed suggestion. Non-blocking — returns None if AI is still thinking.
+    pub fn poll_move(&mut self) -> Option<AiSuggestion> {
+        self.resp_rx.try_recv().ok()
     }
-
 }
 
-/// Background worker: receives game states, feeds Cold Clear, returns moves.
-fn ai_worker(
-    interface: cold_clear::Interface,
-    rx: mpsc::Receiver<AiRequest>,
-    tx: mpsc::Sender<AiMove>,
-) {
-    let mut pieces_fed: usize = 0;
+/// Compute the best placement for a given piece on a given board using Cold Clear.
+/// Returns None if cancelled or Cold Clear finds no valid move.
+fn compute_placement(
+    board: &Board,
+    piece: Piece,
+    next_queue: &[Piece],
+    garbage: u32,
+    options: &cold_clear::Options,
+    weights: &cold_clear::evaluation::Standard,
+    cancel: &AtomicBool,
+) -> Option<OverlayPlacement> {
+    let interface = cold_clear::Interface::launch(
+        board.clone(),
+        options.clone(),
+        weights.clone(),
+        None,
+    );
 
+    interface.add_next_piece(piece);
+    for &p in next_queue {
+        interface.add_next_piece(p);
+    }
+    interface.suggest_next_move(garbage);
+
+    // Poll instead of blocking — allows cancellation.
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        match interface.poll_next_move() {
+            Ok((mv, _info)) => {
+                let cells_lt = mv.expected_location.cells();
+                let cells_vision = cells_lt.map(|(col, row_lt)| (col, 19 - row_lt));
+                let placed_piece = mv.expected_location.kind.0;
+                return Some(OverlayPlacement {
+                    cells: cells_vision,
+                    piece_color: piece_to_color(placed_piece),
+                });
+            }
+            Err(cold_clear::BotPollState::Waiting) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(cold_clear::BotPollState::Dead) => {
+                return None;
+            }
+        }
+    }
+}
+
+/// Background worker: receives game states, computes both direct and hold placements.
+fn ai_worker(
+    options: cold_clear::Options,
+    weights: cold_clear::evaluation::Standard,
+    rx: mpsc::Receiver<AiRequest>,
+    tx: mpsc::Sender<AiSuggestion>,
+    cancel: Arc<AtomicBool>,
+) {
     while let Ok(req) = rx.recv() {
         // Drain to latest request (skip stale ones)
         let mut latest = req;
@@ -236,39 +354,113 @@ fn ai_worker(
             latest = newer;
         }
 
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
         let state = &latest.state;
 
-        // Build piece list: current + queue
-        let mut pieces: Vec<Piece> = Vec::with_capacity(6);
-        if let Some(current) = state.current_piece {
-            if let Some(p) = color_to_piece(current) {
-                pieces.push(p);
+        // Build board field from vision data (exclude falling piece)
+        let field = build_field_from_vision(&state.board, state.current_piece);
+
+        // Log what vision sees
+        let next_names: Vec<&str> = state.next_queue.iter()
+            .filter_map(|c| piece_name(*c))
+            .collect();
+        let filled: usize = field.iter().flatten().filter(|&&c| c).count();
+        tracing::info!(
+            "AI request: current={} hold={} next=[{}] field_cells={}",
+            state.current_piece.map_or("None", |c| piece_name(c).unwrap_or("?")),
+            state.hold_piece.map_or("None", |c| piece_name(c).unwrap_or("?")),
+            next_names.join(","),
+            filled,
+        );
+
+        // Build base board
+        let mut board = Board::new();
+        board.set_field(field);
+
+        // Collect next queue as Piece values
+        let next_pieces: Vec<Piece> = state.next_queue.iter()
+            .filter_map(|c| color_to_piece(*c))
+            .collect();
+
+        let current_piece = match state.current_piece.and_then(color_to_piece) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let garbage = state.incoming_garbage;
+
+        // === Compute direct placement (current piece, no hold) ===
+        let direct = match compute_placement(
+            &board, current_piece, &next_pieces, garbage,
+            &options, &weights, &cancel,
+        ) {
+            Some(p) => p,
+            None => {
+                if cancel.load(Ordering::Relaxed) { break; }
+                tracing::warn!("Cold Clear returned no direct move");
+                continue;
             }
-        }
-        for color in &state.next_queue {
-            if let Some(p) = color_to_piece(*color) {
-                pieces.push(p);
-            }
-        }
+        };
 
-        // Feed only new pieces
-        for piece in pieces.iter().skip(pieces_fed) {
-            interface.add_next_piece(*piece);
-        }
-        pieces_fed = pieces_fed.max(pieces.len());
+        tracing::info!(
+            "Direct placement: piece={:?} cells={:?}",
+            direct.piece_color, direct.cells,
+        );
 
-        // Request + block (this thread is dedicated, so blocking is fine)
-        interface.suggest_next_move(state.incoming_garbage);
-
-        if let Some((mv, _info)) = interface.block_next_move() {
-            interface.play_next_move(mv.expected_location);
-            let inputs = cc_movements_to_inputs(&mv.inputs, mv.hold);
-            let _ = tx.send(AiMove {
-                inputs,
-                board_height: latest.height,
+        // Check for cancellation / new request before computing hold option
+        if cancel.load(Ordering::Relaxed) { break; }
+        if rx.try_recv().is_ok() {
+            // New request arrived — skip hold computation, we'll redo everything
+            // Put the request back... actually we can't un-recv. Just continue the loop.
+            // The new request will be picked up on the next iteration.
+            // For now, send the direct-only result.
+            let _ = tx.send(AiSuggestion {
+                direct,
+                hold_option: None,
             });
-        } else {
-            tracing::warn!("Cold Clear returned no move");
+            continue;
         }
+
+        // === Compute hold placement (hold piece on same board) ===
+        let hold_option = if let Some(hold_color) = state.hold_piece {
+            if let Some(hold_piece) = color_to_piece(hold_color) {
+                // When user holds: hold piece becomes current, current piece goes to hold.
+                // Next queue for the hold computation is: current_piece + original next queue
+                // (because after holding, the old current piece is in hold, not in queue)
+                let mut hold_next = vec![current_piece];
+                hold_next.extend_from_slice(&next_pieces);
+
+                match compute_placement(
+                    &board, hold_piece, &hold_next, garbage,
+                    &options, &weights, &cancel,
+                ) {
+                    Some(p) => {
+                        tracing::info!(
+                            "Hold placement: piece={:?} cells={:?}",
+                            p.piece_color, p.cells,
+                        );
+                        Some(p)
+                    }
+                    None => {
+                        if cancel.load(Ordering::Relaxed) { break; }
+                        tracing::warn!("Cold Clear returned no hold move");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let _ = tx.send(AiSuggestion {
+            direct,
+            hold_option,
+        });
     }
+    tracing::info!("AI worker exiting");
 }

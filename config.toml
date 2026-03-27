@@ -1,5 +1,5 @@
 # =============================================================================
-# TETR.IO Bot Configuration — 1920x1080 Borderless Windowed
+# TETR.IO ESP Overlay Configuration — 1920x1080 Borderless Windowed
 # =============================================================================
 # Calibrated from actual TETR.IO screenshot. Default skin, minimal graphics.
 
@@ -35,26 +35,16 @@ color_tolerance = 40
 
 [ai]
 playstyle = "balanced"   # Options: balanced, aggressive, defensive, tspin
-max_nodes = 400000       # More nodes = stronger but slower (default 400k, was 200k)
+max_nodes = 400000       # More nodes = stronger but slower (default 400k)
 min_nodes = 0
+# Movement mode: "hard_drop_only" = move/rotate at spawn then hard drop (safest),
+#                "twenty_g"       = ground-level moves,
+#                "zero_g"         = tucks & spins (requires SDF infinity)
+movement_mode = "hard_drop_only"
 
-[input]
-# Inter-key timing (milliseconds) — tightened for faster play
-base_delay_ms = 22.0
-jitter_std_ms = 6.0
-key_hold_ms = 14.0
-key_hold_jitter_ms = 4.0
-das_ms = 100.0
-arr_ms = 0.0
-
-# Humanization — reduced for snappier response
-think_pause_chance = 0.08
-think_pause_max_ms = 120.0
-
-# Dynamic PPS limiter — base range, actual PPS adapts to board height
-# Low board: +1.5 to min, +2.0 to max. High board: uses these values.
-pps_target_min = 4.5
-pps_target_max = 7.0
+[overlay]
+# Ghost piece opacity (0-255). Lower = more transparent.
+ghost_opacity = 120
 
 [hotkeys]
 # F9 = Start/Stop (0x78), F10 = Pause/Resume (0x79)

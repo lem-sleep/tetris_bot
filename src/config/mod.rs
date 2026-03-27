@@ -8,7 +8,8 @@ pub struct BotConfig {
     pub capture: CaptureConfig,
     pub vision: VisionConfig,
     pub ai: AiConfig,
-    pub input: InputConfig,
+    #[serde(default)]
+    pub overlay: OverlayConfig,
     #[serde(default)]
     pub hotkeys: HotkeyConfig,
 }
@@ -44,48 +45,22 @@ pub struct AiConfig {
     pub max_nodes: u32,
     #[serde(default = "default_min_nodes")]
     pub min_nodes: u32,
+    #[serde(default = "default_movement_mode")]
+    pub movement_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct InputConfig {
-    #[serde(default = "default_base_delay")]
-    pub base_delay_ms: f64,
-    #[serde(default = "default_jitter")]
-    pub jitter_std_ms: f64,
-    #[serde(default = "default_key_hold")]
-    pub key_hold_ms: f64,
-    #[serde(default = "default_key_hold_jitter")]
-    pub key_hold_jitter_ms: f64,
-    #[serde(default = "default_das")]
-    pub das_ms: f64,
-    #[serde(default = "default_arr")]
-    pub arr_ms: f64,
-    #[serde(default = "default_think_chance")]
-    pub think_pause_chance: f64,
-    #[serde(default = "default_think_max")]
-    pub think_pause_max_ms: f64,
-    #[serde(default = "default_pps_min")]
-    pub pps_target_min: f64,
-    #[serde(default = "default_pps_max")]
-    pub pps_target_max: f64,
+pub struct OverlayConfig {
+    #[serde(default = "default_ghost_opacity")]
+    pub ghost_opacity: u8,
+}
 
-    #[serde(default = "vk_left")]
-    pub vk_left: u16,
-    #[serde(default = "vk_right")]
-    pub vk_right: u16,
-    #[serde(default = "vk_rotate_cw")]
-    pub vk_rotate_cw: u16,
-    #[serde(default = "vk_rotate_ccw")]
-    pub vk_rotate_ccw: u16,
-    #[serde(default = "vk_rotate_180")]
-    pub vk_rotate_180: u16,
-    #[serde(default = "vk_soft_drop")]
-    pub vk_soft_drop: u16,
-    #[serde(default = "vk_hard_drop")]
-    pub vk_hard_drop: u16,
-    #[serde(default = "vk_hold")]
-    pub vk_hold: u16,
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            ghost_opacity: default_ghost_opacity(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,26 +93,8 @@ fn default_tolerance() -> u8 { 40 }
 fn default_playstyle() -> String { "balanced".into() }
 fn default_max_nodes() -> u32 { 400_000 }
 fn default_min_nodes() -> u32 { 0 }
-fn default_base_delay() -> f64 { 22.0 }
-fn default_jitter() -> f64 { 6.0 }
-fn default_key_hold() -> f64 { 14.0 }
-fn default_key_hold_jitter() -> f64 { 4.0 }
-fn default_das() -> f64 { 100.0 }
-fn default_arr() -> f64 { 0.0 }
-fn default_think_chance() -> f64 { 0.08 }
-fn default_think_max() -> f64 { 120.0 }
-fn default_pps_min() -> f64 { 4.5 }
-fn default_pps_max() -> f64 { 7.0 }
-
-// Default TETR.IO keybinds
-fn vk_left() -> u16 { 0x25 }       // VK_LEFT
-fn vk_right() -> u16 { 0x27 }      // VK_RIGHT
-fn vk_rotate_cw() -> u16 { 0x26 }  // VK_UP
-fn vk_rotate_ccw() -> u16 { 0x5A } // Z
-fn vk_rotate_180() -> u16 { 0x41 } // A
-fn vk_soft_drop() -> u16 { 0x28 }  // VK_DOWN
-fn vk_hard_drop() -> u16 { 0x20 }  // Space
-fn vk_hold() -> u16 { 0x43 }       // C
+fn default_movement_mode() -> String { "hard_drop_only".into() }
+fn default_ghost_opacity() -> u8 { 120 }
 
 // Hotkey defaults
 fn vk_toggle() -> u16 { 0x78 }     // F9
