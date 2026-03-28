@@ -34,8 +34,8 @@ next_positions = [
 color_tolerance = 40
 
 [ai]
-playstyle = "balanced"   # Options: balanced, aggressive, defensive, tspin
-max_nodes = 400000       # More nodes = stronger but slower (default 400k)
+playstyle = "aggressive"   # Options: balanced, aggressive, defensive, tspin
+max_nodes = 200000       # More nodes = stronger but slower (default 400k)
 min_nodes = 0
 # Movement mode: "hard_drop_only" = move/rotate at spawn then hard drop (safest),
 #                "twenty_g"       = ground-level moves,
