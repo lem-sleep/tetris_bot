@@ -1,109 +1,89 @@
-# TETR.IO Bot
+# TETR.IO ESP Helper
 
-A high-performance, stealth-oriented TETR.IO bot written in Rust. It runs as a separate process alongside the official TETR.IO Desktop client — reading the game state via screen capture and sending moves via simulated keyboard input.
+A real-time AI placement assistant for TETR.IO, written in Rust. It reads the game state via screen capture, uses Cold Clear to compute the optimal piece placement, and draws a transparent ghost overlay directly on the playfield showing exactly where to place your current piece (and hold piece). **No inputs are sent — you play manually.**
+
+## What It Does
+
+- Captures the TETR.IO screen using the DXGI Desktop Duplication API
+- Reads the board, current piece, hold piece, and next queue via computer vision
+- Computes the best placement for the current piece and the best placement if you hold first
+- Draws both options as colored ghost pieces directly over the game using a transparent Win32 layered window
+- Pre-computes placements for upcoming queue pieces in the background so the ghost appears instantly when each new piece spawns
 
 ## Architecture
 
-The bot does **not** modify the TETR.IO client in any way. Instead it operates externally:
-
-1. **Screen Capture** — Grabs frames from the desktop using the DXGI Desktop Duplication API (zero-copy, GPU-accelerated)
-2. **Computer Vision** — Samples pixel colors at known grid positions and classifies them via HSV hue ranges to reconstruct the full board state, hold piece, next queue, and active piece
-3. **AI Engine** — Feeds the reconstructed game state into Cold Clear (the strongest open-source Tetris AI) which computes the optimal placement
-4. **Input Simulation** — Translates the AI's move into a sequence of keyboard inputs sent via Windows `SendInput`, with humanized timing (jitter, PPS limiting, thinking pauses, DAS/ARR-aware delays)
-
 ```
-┌─────────────────┐     DXGI      ┌──────────────┐    HSV     ┌─────────────┐
-│  TETR.IO Client  │──────────────▶│ Screen Capture│──────────▶│ Board Reader │
-│  (unmodified)    │               │  (capture/)   │  pixels   │  (vision/)   │
-└─────────────────┘               └──────────────┘           └──────┬──────┘
-        ▲                                                           │ GameState
-        │  SendInput                                                ▼
-┌───────┴────────┐    MoveInputs   ┌──────────────┐  Pieces  ┌─────────────┐
-│ Input Sender    │◀───────────────│  AI Engine    │◀─────────│ Cold Clear  │
-│  (input/)       │   humanized    │  (ai/)        │  moves   │  (external) │
-└────────────────┘                └──────────────┘           └─────────────┘
+┌─────────────────┐    DXGI     ┌───────────────┐   pixels  ┌──────────────┐
+│  TETR.IO Client  │────────────▶│ Screen Capture │──────────▶│ Board Reader │
+│  (unmodified)    │             │  (capture/)    │           │  (vision/)   │
+└─────────────────┘             └───────────────┘           └──────┬───────┘
+                                                                    │ GameState
+                                                                    ▼
+┌─────────────────┐  suggestion  ┌───────────────┐  Pieces  ┌──────────────┐
+│ Win32 Overlay    │◀────────────│   AI Engine    │◀─────────│  Cold Clear  │
+│  (overlay.rs)    │  ghost cells │   (ai/)        │  moves   │  (external)  │
+└─────────────────┘             └───────────────┘           └──────────────┘
+         ▲
+         │ shared state (Arc<BotState>)
+┌────────┴────────┐
+│   egui Control  │
+│     Panel       │
+└─────────────────┘
 ```
-
-## File Structure
-
-### Core Modules (`src/`)
-
-| File | Purpose |
-|------|---------|
-| `main.rs` | Entry point. Spawns the bot loop on a background thread and runs the eframe/egui GUI on the main thread. Manages shared state (enabled/paused/PPS/pieces placed) between the bot thread and GUI via `Arc<BotState>`. Polls F9/F10 hotkeys via `GetAsyncKeyState`. |
-| `capture/mod.rs` | Wraps `dxgi-capture-rs` (`DXGIManager`) for screen capture. `Frame` struct holds raw BGRA pixel data with `pixel_rgb(x, y)` and `crop()` methods. Caches the last successful frame so DXGI timeouts (no screen change) return stale data instead of erroring. |
-| `vision/mod.rs` | Computer vision / board reading. `BoardReader` samples pixel centers of each cell in the 10x20 grid, hold box, and 5-slot next queue. `classify_color()` converts RGB → HSV and matches hue ranges calibrated from actual TETR.IO default skin pixel samples. Detects the active piece by scanning top rows, and infers game-active state from bottom rows. |
-| `ai/mod.rs` | Wraps the Cold Clear AI engine (`cold_clear::Interface`). Translates `CellColor` → `libtetris::Piece`, feeds pieces incrementally (tracking `pieces_fed` to avoid duplicates), calls `suggest_next_move()` + `block_next_move()`, then converts Cold Clear's `PieceMovement` sequence (Left/Right/Cw/Ccw/SonicDrop) into our `MoveInput` enum. Supports 4 playstyles (balanced/aggressive/tspin/defensive) with tuned evaluator weights. |
-| `input/mod.rs` | Sends keyboard inputs to TETR.IO via Windows `SendInput` API using `KEYBDINPUT` with scan codes. Humanization features: Gaussian jitter on inter-key delay and key hold duration, PPS rate limiter (default 4.0–6.5 PPS), random thinking pauses (12% chance, up to 180ms), ARR timing for repeated lateral moves, direction-switch hesitation. |
-| `config/mod.rs` | Loads all settings from `config.toml` via serde. Structs: `CaptureConfig` (region, FPS), `VisionConfig` (board/hold/next pixel coordinates, cell size), `AiConfig` (playstyle), `InputConfig` (timing, humanization, keybinds), `HotkeyConfig` (toggle/pause keys). All fields have sensible defaults matching TETR.IO's default keybinds. |
-
-### Calibration Tools (`src/bin/`)
-
-| File | Purpose |
-|------|---------|
-| `calibrate.rs` | Live calibration tool — captures a DXGI screenshot and saves it as PNG. Subcommands: `sample` (read pixel color at coordinates), `grid` (draw board overlay), `scan` (edge detection). Requires TETR.IO to be visible on screen. |
-| `analyze.rs` | Offline analysis tool — reads a previously saved PNG file (no live capture needed). Subcommands: `find` (auto-detect board edges), `sample` (pixel color), `grid` (overlay), `hscan`/`vscan` (brightness transition scanning). Used to verify and fine-tune calibration from VS Code without needing TETR.IO in the foreground. |
-
-### Configuration
-
-| File | Purpose |
-|------|---------|
-| `config.toml` | All tunable parameters. Calibrated for 1920x1080 borderless windowed, default TETR.IO skin, minimal graphics. Board grid starts at pixel (733, 86) with 45px cells. Hold piece sampled at (618, 190). Next queue at 5 positions along x=1310. |
-| `Cargo.toml` | Rust dependencies and build config. Key crates: `dxgi-capture-rs` (screen capture), `cold-clear` + `libtetris` (AI), `windows` (SendInput), `eframe` (GUI), `rand`/`rand_distr` (humanization). Release profile uses LTO + single codegen unit for max performance. |
-
-## Dependencies
-
-- **[dxgi-capture-rs](https://crates.io/crates/dxgi-capture-rs)** — DXGI Desktop Duplication wrapper for zero-copy screen capture
-- **[cold-clear](https://github.com/MinusKelvin/cold-clear)** — Strongest open-source Tetris AI (archived Jan 2024, still functional)
-- **[libtetris](https://github.com/MinusKelvin/cold-clear)** — Tetris types (Board, Piece, FallingPiece, PieceMovement) from the cold-clear workspace
-- **[eframe/egui](https://github.com/emilk/egui)** — Immediate-mode GUI for the control panel
-- **[windows](https://crates.io/crates/windows)** — Official Microsoft Windows API bindings (SendInput, GetAsyncKeyState, MapVirtualKeyW)
 
 ## How It Works
 
-### Color Classification (Vision)
+### 1. Screen Capture
 
-Pixels are converted from RGB to HSV. Classification uses calibrated hue ranges from actual TETR.IO screenshots:
+Uses the DXGI Desktop Duplication API (`dxgi-capture-rs`) for zero-copy GPU-accelerated frame capture. A sentinel pixel check skips full processing on unchanged frames, keeping CPU usage minimal.
 
-| Piece | Color | Hue Range |
-|-------|--------|-----------|
-| Z | Red | 345°–360°, 0°–15° |
-| L | Orange | 16°–45° |
-| O | Yellow | 46°–75° |
-| S | Green | 76°–150° |
-| I | Cyan | 151°–195° |
-| J | Blue | 196°–265° |
-| T | Purple | 266°–344° |
+### 2. Computer Vision
 
-Brightness < 30 → Empty. Saturation < 0.20 → Garbage (if bright) or Empty.
+`BoardReader` samples pixel centers of each cell in the 10×20 grid, the hold box, and the 5-slot next queue. A 64×64×64 RGB lookup table (LUT) classifies colors in O(1) — piece colors are identified by HSV hue ranges calibrated from actual TETR.IO screenshots.
 
-### AI Integration (Cold Clear)
+A connected-component flood fill strips the falling piece from the board before feeding it to the AI, so Cold Clear always sees a clean locked board.
 
-Cold Clear runs on background threads. The bot feeds it pieces incrementally as they become visible in the queue. On each board change:
+### 3. AI Engine (Cold Clear)
 
-1. Feed any new pieces (current + next queue) via `add_next_piece()`
-2. Call `suggest_next_move(incoming_garbage)` to request computation
-3. Call `block_next_move()` to wait for the result
-4. Call `play_next_move(expected_location)` to advance Cold Clear's internal state
-5. Convert the resulting `PieceMovement` list to keyboard inputs
+Cold Clear runs on a background worker thread. For each new piece spawn:
 
-### Humanization (Input)
+1. **Primary computation** — direct placement for the current piece + placement if you hold first. Result is sent immediately when ready.
+2. **Prefetch pipeline** — while the current piece is falling, the worker pre-computes placements for the next 3 queue pieces in the background. When those pieces spawn, their ghost appears **instantly** with no thinking delay.
 
-To mimic human play patterns:
-- **PPS limiting**: Each piece placement is throttled to 4.0–6.5 pieces per second
-- **Gaussian jitter**: Inter-key delay (28ms ± 8ms) and key hold time (18ms ± 5ms) vary naturally
-- **Thinking pauses**: 12% chance of a 20–180ms pause before starting inputs
-- **DAS/ARR timing**: Repeated lateral moves use ARR delay; direction switches add hesitation
-- **All timing is configurable** via `config.toml`
+If a new primary request arrives mid-prefetch, prefetching is interrupted and the new request is handled immediately.
+
+### 4. Transparent Overlay
+
+A native Win32 layered window (`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST`) covers the board with click-through transparency. Uses `UpdateLayeredWindow` with `ULW_ALPHA` and per-pixel pre-multiplied alpha — the same technique used by Discord, Steam, and other game overlays.
+
+Two placements are drawn simultaneously:
+- **Bright ghost** — where to place the current piece directly
+- **Dimmer ghost** — where the hold piece would go if you swap first
+
+### 5. Ghost Stability
+
+The AI is queried **exactly once per piece spawn**, not on every frame. The recommendation locks in the moment a new piece is detected and stays fixed until the piece is placed, regardless of how the falling piece moves. No flashing, no jitter.
+
+## File Structure
+
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | Entry point. Bot loop (capture → vision → AI → overlay), hotkey handling, egui control panel, prefetch cache management. |
+| `src/capture/mod.rs` | DXGI screen capture wrapper. Caches last frame; includes dirty-pixel check to skip unchanged frames. |
+| `src/vision/mod.rs` | Board reader. RGB→CellColor LUT, connected-component falling-piece detection, hold/next queue sampling. |
+| `src/ai/mod.rs` | Cold Clear wrapper. Per-piece-spawn computation, two-channel worker (primary + prefetch), cancellable polling, `catch_unwind` for stability. |
+| `src/overlay.rs` | Win32 layered-window overlay. 32-bit DIB section, per-pixel alpha, 60fps render loop drawing direct and hold ghost cells. |
+| `src/config/mod.rs` | Config loader. Reads `config.toml` via serde into typed structs. |
+| `config.toml` | All tunable parameters — capture region, board pixel coordinates, AI playstyle, ghost opacity, hotkeys. |
 
 ## Controls
 
 | Key | Action |
 |-----|--------|
-| F9 | Start / Stop the bot |
-| F10 | Pause / Resume (while running) |
+| F9  | Start / Stop |
+| F10 | Pause / Resume |
 
-The GUI window (always-on-top) shows status, pieces placed, current PPS, and has clickable Start/Stop/Pause buttons.
+The egui control panel (always-on-top) shows status and the current piece recommendation. The overlay draws the ghost directly on the game.
 
 ## Setup
 
@@ -114,20 +94,56 @@ The GUI window (always-on-top) shows status, pieces placed, current PPS, and has
    cd tetris_bot
    cargo build --release
    ```
-3. Open TETR.IO Desktop in **1920x1080 borderless windowed** mode with **default skin** and **minimal graphics**
-4. Run the bot:
+3. Open TETR.IO Desktop in **1920×1080 borderless windowed** with the **default skin** and **minimal graphics**
+4. Run:
    ```
-   cargo run --release
+   target\release\tetris_bot.exe
    ```
-5. Start a Zen mode game, then press **F9** to activate
+5. Start a Zen mode game and press **F9** to activate
 
-### Recalibration
+## Configuration (`config.toml`)
 
-If your screen layout differs (different resolution, skin, or window position), use the calibration tools:
+```toml
+[capture]
+x = 0              # Screen region to capture (top-left corner)
+y = 0
+width = 1920
+height = 1080
+target_fps = 60
 
+[vision]
+board_x = 733      # Pixel coordinate of top-left board cell
+board_y = 86
+cell_size = 45     # Cell size in pixels
+hold_x = 618       # Hold piece sample point
+hold_y = 190
+next_positions = [ # 5 next-queue sample points
+    [1310, 218],
+    [1310, 354],
+    [1310, 467],
+    [1310, 603],
+    [1310, 717],
+]
+
+[ai]
+playstyle = "balanced"    # balanced | aggressive | defensive | tspin
+max_nodes = 400000        # Higher = stronger but slower AI
+movement_mode = "hard_drop_only"
+
+[overlay]
+ghost_opacity = 120       # 0–255 ghost piece transparency
+
+[hotkeys]
+vk_toggle = 0x78          # F9
+vk_pause  = 0x79          # F10
 ```
-cargo run --bin calibrate -- sample 960 540    # Check pixel color at coordinates
-cargo run --bin analyze -- find screenshot.png  # Auto-detect board edges from a saved screenshot
-```
 
-Then update the coordinates in `config.toml`.
+If your screen layout differs (different resolution, window position, or skin), update `board_x`, `board_y`, `cell_size`, `hold_x`/`hold_y`, and `next_positions` to match your setup.
+
+## Dependencies
+
+- **[dxgi-capture-rs](https://crates.io/crates/dxgi-capture-rs)** — DXGI Desktop Duplication for zero-copy screen capture
+- **[cold-clear](https://github.com/MinusKelvin/cold-clear)** — Strongest open-source Tetris AI
+- **[libtetris](https://github.com/MinusKelvin/cold-clear)** — Tetris types (Board, Piece, FallingPiece) from the cold-clear workspace
+- **[eframe/egui](https://github.com/emilk/egui)** — Immediate-mode GUI for the control panel
+- **[windows](https://crates.io/crates/windows)** — Win32 API bindings (layered windows, GDI, keyboard state)
