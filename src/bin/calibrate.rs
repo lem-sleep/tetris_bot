@@ -116,11 +116,13 @@ fn sample_pixel(pixels: &[u8], stride_w: u32, x: u32, y: u32) {
     let r = pixels[offset + 2];
 
     let (h, s, v) = rgb_to_hsv(r, g, b);
+    let piece = classify_piece(r, g, b);
+    let ghost_note = if v < 0.35 && v >= 0.15 { " ← ghost piece range (filtered)" } else { "" };
 
     println!("Pixel at ({x}, {y}):");
     println!("  RGB: ({r}, {g}, {b})");
-    println!("  HSV: ({h:.0}, {s:.2}, {v:.2})");
-    println!("  Likely piece: {}", classify_piece(r, g, b));
+    println!("  HSV: hue={h:.0}  sat={s:.2}  val={v:.2}{ghost_note}");
+    println!("  Classified as: {piece}");
 
     // Also sample a 3x3 area around the point
     println!("\n3x3 neighborhood:");
@@ -140,47 +142,62 @@ fn sample_pixel(pixels: &[u8], stride_w: u32, x: u32, y: u32) {
     }
 }
 
-fn print_grid_samples(pixels: &[u8], stride_w: u32, bx: u32, by: u32, cs: u32) {
-    println!("Board grid sample (center of each cell):\n");
-    println!("Config: board_x={bx}, board_y={by}, cell_size={cs}\n");
+/// Sample a cell at 5 points (center + NESW) and return the majority classification.
+/// Marks uncertain cells (< 3/5 agreement) with a '?' suffix.
+fn sample_cell_votes(pixels: &[u8], stride_w: u32, cx: u32, cy: u32, off: u32) -> (&'static str, u8) {
+    let offsets: [(i32, i32); 5] = [(0, 0), (-(off as i32), 0), (off as i32, 0), (0, -(off as i32)), (0, off as i32)];
+    let mut counts = [0u8; 10]; // indexed by piece symbol index
+    let labels = [".", "I", "O", "T", "S", "Z", "J", "L", "G", "?"];
 
-    // Print column headers
-    print!("     ");
-    for col in 0..10 {
-        print!("  {col:^5} ");
+    for &(dx, dy) in &offsets {
+        let x = (cx as i32 + dx).max(0) as u32;
+        let y = (cy as i32 + dy).max(0) as u32;
+        let offset = (y * stride_w * 4 + x * 4) as usize;
+        if offset + 3 < pixels.len() {
+            let r = pixels[offset + 2];
+            let g = pixels[offset + 1];
+            let b = pixels[offset];
+            let label = classify_piece(r, g, b);
+            let idx = labels.iter().position(|&l| l == label).unwrap_or(9);
+            counts[idx] = counts[idx].saturating_add(1);
+        }
     }
+
+    // Find best non-empty vote
+    let mut best_idx = 0usize; // empty
+    let mut best_count = 0u8;
+    for i in 1..9 { // skip empty (0) and unknown (9)
+        if counts[i] > best_count {
+            best_count = counts[i];
+            best_idx = i;
+        }
+    }
+    if best_count == 0 { best_idx = 0; best_count = counts[0]; }
+    (labels[best_idx], best_count)
+}
+
+fn print_grid_samples(pixels: &[u8], stride_w: u32, bx: u32, by: u32, cs: u32) {
+    println!("Board grid (5-point vote, center ± {off}px):\n", off = cs / 4);
+    println!("Config: board_x={bx}, board_y={by}, cell_size={cs}");
+    println!("Legend: letter = piece,  . = empty,  * = uncertain (< 3/5 votes)\n");
+
+    print!("     ");
+    for col in 0..10 { print!(" {col:^3} "); }
     println!();
 
+    let off = cs / 4;
     for row in 0..20u32 {
         print!("R{row:02} ");
         for col in 0..10u32 {
-            let px = bx + col * cs + cs / 2;
-            let py = by + row * cs + cs / 2;
-            let offset = (py * stride_w * 4 + px * 4) as usize;
-            if offset + 3 < pixels.len() {
-                let r = pixels[offset + 2];
-                let g = pixels[offset + 1];
-                let b = pixels[offset];
-                let piece = classify_piece(r, g, b);
-                let symbol = match piece {
-                    "Empty" => " . ",
-                    "I" => " I ",
-                    "O" => " O ",
-                    "T" => " T ",
-                    "S" => " S ",
-                    "Z" => " Z ",
-                    "J" => " J ",
-                    "L" => " L ",
-                    "Garbage" => " G ",
-                    _ => " ? ",
-                };
-                print!("  {symbol:^5} ");
-            } else {
-                print!("  OOB   ");
-            }
+            let cx = bx + col * cs + cs / 2;
+            let cy = by + row * cs + cs / 2;
+            let (piece, votes) = sample_cell_votes(pixels, stride_w, cx, cy, off);
+            let uncertain = votes < 3 && piece != ".";
+            print!(" {:^3} ", if uncertain { "*" } else { piece });
         }
         println!();
     }
+    println!("\n(Run with 'sample <x> <y>' to inspect individual pixels)");
 }
 
 fn scan_row(pixels: &[u8], stride_w: u32, y: u32, x_start: u32, x_end: u32) {
@@ -213,49 +230,42 @@ fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     let r = r as f32 / 255.0;
     let g = g as f32 / 255.0;
     let b = b as f32 / 255.0;
-
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let delta = max - min;
-
     let v = max;
     let s = if max == 0.0 { 0.0 } else { delta / max };
-
-    let h = if delta == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / delta) % 6.0)
-    } else if max == g {
-        60.0 * (((b - r) / delta) + 2.0)
-    } else {
-        60.0 * (((r - g) / delta) + 4.0)
-    };
-
+    let h = if delta == 0.0 { 0.0 }
+        else if max == r { 60.0 * (((g - b) / delta) % 6.0) }
+        else if max == g { 60.0 * (((b - r) / delta) + 2.0) }
+        else { 60.0 * (((r - g) / delta) + 4.0) };
     let h = if h < 0.0 { h + 360.0 } else { h };
     (h, s, v)
 }
 
+/// Classify a pixel — kept in sync with vision/mod.rs classify_rgb().
+/// Same ghost-piece filter (v < 0.35), same hue ranges, same saturation threshold.
 fn classify_piece(r: u8, g: u8, b: u8) -> &'static str {
     let brightness = (r as u16 + g as u16 + b as u16) / 3;
-    if brightness < 30 {
-        return "Empty";
+    if brightness < 30 { return "."; }
+
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+
+    // Ghost-piece filter: same threshold as the bot uses
+    if v < 0.35 { return "."; }
+
+    if s < 0.22 {
+        return if brightness > 80 { "G" } else { "." };
     }
 
-    let (h, s, _v) = rgb_to_hsv(r, g, b);
-
-    if s < 0.15 {
-        return if brightness > 80 { "Garbage" } else { "Empty" };
-    }
-
-    // Classify by hue
     match h as u32 {
-        0..=15 | 345..=360 => "Z",      // Red
-        16..=45 => "L",                   // Orange
-        46..=70 => "O",                   // Yellow
-        71..=160 => "S",                  // Green
-        161..=200 => "I",                 // Cyan
-        201..=260 => "J",                 // Blue
-        261..=330 => "T",                 // Purple
-        _ => "Unknown",
+        0..=15 | 345..=360 => "Z",
+        16..=45            => "L",
+        46..=75            => "O",
+        76..=150           => "S",
+        151..=195          => "I",
+        196..=265          => "J",
+        266..=344          => "T",
+        _                  => ".",
     }
 }

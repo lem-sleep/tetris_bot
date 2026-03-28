@@ -18,6 +18,8 @@ pub struct BotState {
     pub status_text: Mutex<String>,
     /// Current AI suggestion (direct + hold placements) for the overlay.
     pub current_suggestion: Mutex<Option<ai::AiSuggestion>>,
+    /// Latest vision confidence (0–100). Stored as u8 percentage for lock-free access.
+    pub vision_confidence_pct: std::sync::atomic::AtomicU8,
 }
 
 impl BotState {
@@ -27,6 +29,7 @@ impl BotState {
             paused: AtomicBool::new(false),
             status_text: Mutex::new("Stopped".into()),
             current_suggestion: Mutex::new(None),
+            vision_confidence_pct: std::sync::atomic::AtomicU8::new(100),
         }
     }
 
@@ -171,6 +174,10 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
         let vision_ms = vision_start.elapsed().as_secs_f64() * 1000.0;
         debug!("Vision: {vision_ms:.2}ms");
 
+        // Update confidence display (always, even on low confidence frames)
+        let conf_pct = (game_state.vision_confidence * 100.0).round() as u8;
+        state.vision_confidence_pct.store(conf_pct, Ordering::Relaxed);
+
         if !game_state.is_active || game_state.current_piece.is_none() {
             // No active piece — clear lock so next piece spawn triggers AI
             if locked_piece.is_some() {
@@ -178,6 +185,22 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
                 debug!("Piece gone — lock cleared, ready for next spawn");
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+
+        // === Vision confidence gate ===
+        // If the board read is untrustworthy, don't feed bad state to the AI.
+        let conf_threshold = board_reader.confidence_threshold();
+        if game_state.vision_confidence < conf_threshold {
+            warn!(
+                "Vision confidence {:.0}% below threshold {:.0}% — skipping AI",
+                game_state.vision_confidence * 100.0,
+                conf_threshold * 100.0,
+            );
+            // Clear suggestion so the overlay shows nothing rather than a stale/wrong ghost
+            *state.current_suggestion.lock().unwrap() = None;
+            locked_piece = None;
+            std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
 
@@ -255,6 +278,7 @@ impl eframe::App for BotApp {
         let paused = self.state.paused.load(Ordering::Relaxed);
         let status = self.state.status_text.lock().unwrap().clone();
         let suggestion = self.state.current_suggestion.lock().unwrap().clone();
+        let conf_pct = self.state.vision_confidence_pct.load(Ordering::Relaxed);
 
         // === Control panel ===
         eframe::egui::CentralPanel::default().show(ctx, |ui| {
@@ -272,6 +296,21 @@ impl eframe::App for BotApp {
                 };
                 ui.colored_label(color, eframe::egui::RichText::new(text).size(18.0).strong());
             });
+
+            // Vision confidence indicator (only shown while running)
+            if enabled && !paused {
+                ui.horizontal(|ui| {
+                    ui.label("Vision:");
+                    let (conf_color, conf_text) = if conf_pct >= 80 {
+                        (eframe::egui::Color32::from_rgb(60, 180, 60),  format!("{conf_pct}% OK"))
+                    } else if conf_pct >= 60 {
+                        (eframe::egui::Color32::from_rgb(220, 180, 50), format!("{conf_pct}% LOW"))
+                    } else {
+                        (eframe::egui::Color32::from_rgb(220, 60, 60),  format!("{conf_pct}% BAD — CHECK CALIBRATION"))
+                    };
+                    ui.colored_label(conf_color, eframe::egui::RichText::new(conf_text).strong());
+                });
+            }
 
             ui.add_space(8.0);
 

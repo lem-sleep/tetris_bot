@@ -176,7 +176,8 @@ fn find_board(img: &image::RgbaImage) {
 fn sample(img: &image::RgbaImage, x: u32, y: u32) {
     let p = img.get_pixel(x, y);
     let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
-    println!("Pixel ({x}, {y}): RGB({}, {}, {})  HSV({h:.0}, {s:.2}, {v:.2})  => {}",
+    let ghost_note = if v < 0.35 && v >= 0.15 { " ← ghost piece range (filtered to empty)" } else { "" };
+    println!("Pixel ({x}, {y}): RGB({}, {}, {})  HSV(h={h:.0}, s={s:.2}, v={v:.2}){ghost_note}  => {}",
         p[0], p[1], p[2], classify(p[0], p[1], p[2]));
 
     println!("5x5 neighborhood:");
@@ -192,7 +193,9 @@ fn sample(img: &image::RgbaImage, x: u32, y: u32) {
 }
 
 fn print_grid(img: &image::RgbaImage, bx: u32, by: u32, cs: u32) {
-    println!("Board grid: top-left=({bx},{by}) cell_size={cs}\n");
+    let off = (cs / 4).max(4) as i32;
+    println!("Board grid (5-point vote, ±{off}px)  top-left=({bx},{by}) cell_size={cs}");
+    println!("Legend: letter=piece  .=empty  *=uncertain (<3/5 votes)\n");
     print!("     ");
     for c in 0..10 { print!(" {:^3} ", c); }
     println!();
@@ -200,18 +203,36 @@ fn print_grid(img: &image::RgbaImage, bx: u32, by: u32, cs: u32) {
     for row in 0..20u32 {
         print!("R{row:02} ");
         for col in 0..10u32 {
-            let cx = bx + col * cs + cs / 2;
-            let cy = by + row * cs + cs / 2;
-            let p = img.get_pixel(cx, cy);
-            let piece = classify(p[0], p[1], p[2]);
-            let ch = match piece {
-                "Empty" => ".",
-                "I" => "I", "O" => "O", "T" => "T",
-                "S" => "S", "Z" => "Z", "J" => "J", "L" => "L",
-                "Garbage" => "G",
-                _ => "?",
+            let cx = (bx + col * cs + cs / 2) as i32;
+            let cy = (by + row * cs + cs / 2) as i32;
+
+            // 5-point sampling: center + NESW
+            let pts = [(0,0), (-off,0), (off,0), (0,-off), (0,off)];
+            let mut counts = [0u8; 9]; // I O T S Z J L G .
+            let labels = [".", "I", "O", "T", "S", "Z", "J", "L", "G"];
+
+            for &(dx, dy) in &pts {
+                let px = (cx + dx).clamp(0, img.width() as i32 - 1) as u32;
+                let py = (cy + dy).clamp(0, img.height() as i32 - 1) as u32;
+                let p = img.get_pixel(px, py);
+                let label = classify(p[0], p[1], p[2]);
+                if let Some(i) = labels.iter().position(|&l| l == label) {
+                    counts[i] = counts[i].saturating_add(1);
+                }
+            }
+
+            // Best non-empty vote
+            let mut best_i = 0usize;
+            let mut best_v = 0u8;
+            for i in 1..9 {
+                if counts[i] > best_v { best_v = counts[i]; best_i = i; }
+            }
+            let (ch, uncertain) = if best_v == 0 {
+                (".", false)
+            } else {
+                (labels[best_i], best_v < 3)
             };
-            print!("  {ch}  ");
+            print!(" {:^3} ", if uncertain { "*" } else { ch });
         }
         println!();
     }
@@ -266,19 +287,22 @@ fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (h, s, v)
 }
 
+/// Classify a pixel — kept in sync with vision/mod.rs classify_rgb().
+/// Same ghost-piece filter (v < 0.35), same hue ranges, same thresholds.
 fn classify(r: u8, g: u8, b: u8) -> &'static str {
     let bright = (r as u16 + g as u16 + b as u16) / 3;
-    if bright < 30 { return "Empty"; }
-    let (h, s, _) = rgb_to_hsv(r, g, b);
-    if s < 0.15 { return if bright > 80 { "Garbage" } else { "Empty" }; }
+    if bright < 30 { return "."; }
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+    if v < 0.35 { return "."; }                              // ghost filter
+    if s < 0.22 { return if bright > 80 { "G" } else { "." }; }
     match h as u32 {
         0..=15 | 345..=360 => "Z",
-        16..=45 => "L",
-        46..=70 => "O",
-        71..=160 => "S",
-        161..=200 => "I",
-        201..=260 => "J",
-        261..=330 => "T",
-        _ => "?",
+        16..=45  => "L",
+        46..=75  => "O",
+        76..=150 => "S",
+        151..=195 => "I",
+        196..=265 => "J",
+        266..=344 => "T",
+        _ => ".",
     }
 }

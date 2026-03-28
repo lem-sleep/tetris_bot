@@ -35,6 +35,11 @@ pub struct VisionConfig {
     pub next_positions: Vec<(u32, u32)>,
     #[serde(default = "default_tolerance")]
     pub color_tolerance: u8,
+    /// Fraction of non-empty board cells that must have strong (≥ 3/5) sample
+    /// agreement before trusting the board state to the AI.  0.0 = always trust,
+    /// 1.0 = all cells must agree perfectly.  Default 0.7.
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +95,7 @@ impl BotConfig {
 
 fn default_fps() -> u32 { 60 }
 fn default_tolerance() -> u8 { 40 }
+fn default_confidence_threshold() -> f32 { 0.7 }
 fn default_playstyle() -> String { "balanced".into() }
 fn default_max_nodes() -> u32 { 400_000 }
 fn default_min_nodes() -> u32 { 0 }

@@ -33,6 +33,14 @@ next_positions = [
 
 color_tolerance = 40
 
+# Minimum fraction of non-empty board cells that must have strong (>=3/5) sample
+# agreement before trusting the board state to the AI.
+# 0.0 = always trust (not recommended), 1.0 = require all cells to agree perfectly.
+# If confidence drops below this, the ghost overlay clears and a warning appears.
+# Lower this (e.g. 0.5) if you get frequent "CHECK CALIBRATION" warnings on a
+# correctly-calibrated setup — can happen on busy boards with anti-aliasing.
+confidence_threshold = 0.7
+
 [ai]
 playstyle = "aggressive"   # Options: balanced, aggressive, defensive, tspin
 max_nodes = 200000       # More nodes = stronger but slower (default 400k)

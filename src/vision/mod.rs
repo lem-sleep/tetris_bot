@@ -2,12 +2,22 @@
 //!
 //! Extracts the full game state from a captured frame by sampling pixel colors
 //! at known grid positions. Uses a precomputed RGB→CellColor LUT for O(1)
-//! classification, multi-point sampling per cell for noise tolerance, and a
-//! ghost-piece filter so TETR.IO's dim ghost overlay doesn't pollute the board.
+//! classification, 5-point multi-sample voting per cell for noise tolerance,
+//! and a ghost-piece filter so TETR.IO's dim drop-shadow doesn't pollute the board.
+//!
+//! # Confidence scoring
+//! After each board read, a `vision_confidence` value (0.0–1.0) is computed from
+//! the fraction of non-empty cells that had strong (≥ 3/5) sample agreement.
+//! Values below `config.vision.confidence_threshold` mean calibration is off or
+//! the game is not in an expected state — the main loop skips AI submission.
 
 use anyhow::Result;
 use crate::capture::Frame;
 use crate::config::VisionConfig;
+
+// ─────────────────────────────────────────────
+//  Public types
+// ─────────────────────────────────────────────
 
 /// The 7 standard Tetris pieces + empty + garbage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,6 +44,9 @@ pub struct GameState {
     pub next_queue:       Vec<CellColor>,
     pub is_active:        bool,
     pub incoming_garbage: u32,
+    /// 0.0–1.0. Fraction of non-empty board cells where ≥ 3/5 sample points
+    /// agreed on the same classification. Low values = calibration problem.
+    pub vision_confidence: f32,
 }
 
 // ─────────────────────────────────────────────
@@ -41,7 +54,7 @@ pub struct GameState {
 // ─────────────────────────────────────────────
 
 /// Precomputed RGB → CellColor lookup table.
-/// Indexed by (r >> 2, g >> 2, b >> 2) → 64×64×64 = 262 144 entries.
+/// Indexed by (r >> 2, g >> 2, b >> 2) → 64×64×64 = 262 144 entries (~256 KB).
 struct ColorLut {
     table: Vec<CellColor>,
 }
@@ -56,7 +69,7 @@ impl ColorLut {
                     let g = (gi * 4 + 2) as u8;
                     let b = (bi * 4 + 2) as u8;
                     let idx = (ri * 64 * 64 + gi * 64 + bi) as usize;
-                    table[idx] = classify_color_slow(r, g, b);
+                    table[idx] = classify_rgb(r, g, b);
                 }
             }
         }
@@ -84,6 +97,7 @@ pub struct BoardReader {
     hold_x:     u32,
     hold_y:     u32,
     next_positions: Vec<(u32, u32)>,
+    confidence_threshold: f32,
     lut:        ColorLut,
     /// Precomputed center pixel coordinates for each of the 200 board cells.
     cell_coords: [(u32, u32); 200],
@@ -105,13 +119,13 @@ impl BoardReader {
             }
         }
 
-        // Sentinel pixels: scatter across the board + hold + first next slot
+        // Sentinel pixels: spread across the board to catch any change
         let mut sentinels = vec![
-            cell_coords[0  * 10 + 4],   // row 0,  col 4  (top spawn zone)
-            cell_coords[0  * 10 + 5],   // row 0,  col 5
-            cell_coords[4  * 10 + 4],   // row 4,  col 4
-            cell_coords[10 * 10 + 5],   // row 10, col 5  (mid board)
-            cell_coords[15 * 10 + 3],   // row 15, col 3
+            cell_coords[0  * 10 + 4],   // row 0 col 4 — spawn zone
+            cell_coords[0  * 10 + 5],   // row 0 col 5 — spawn zone
+            cell_coords[4  * 10 + 4],   // row 4 col 4
+            cell_coords[10 * 10 + 5],   // mid board
+            cell_coords[15 * 10 + 3],
             cell_coords[19 * 10 + 0],   // bottom-left
             cell_coords[19 * 10 + 9],   // bottom-right
             (cfg.hold_x, cfg.hold_y),
@@ -120,6 +134,12 @@ impl BoardReader {
             sentinels.push((nx, ny));
         }
 
+        tracing::info!(
+            "BoardReader ready: board at ({},{}) cell_size={} confidence_threshold={:.0}%",
+            cfg.board_x, cfg.board_y, cfg.cell_size,
+            cfg.confidence_threshold * 100.0
+        );
+
         Ok(Self {
             board_x:  cfg.board_x,
             board_y:  cfg.board_y,
@@ -127,6 +147,7 @@ impl BoardReader {
             hold_x:   cfg.hold_x,
             hold_y:   cfg.hold_y,
             next_positions: cfg.next_positions.clone(),
+            confidence_threshold: cfg.confidence_threshold,
             lut,
             cell_coords,
             sentinel_coords:      sentinels,
@@ -134,11 +155,16 @@ impl BoardReader {
         })
     }
 
+    /// Confidence threshold below which we consider the board untrustworthy.
+    pub fn confidence_threshold(&self) -> f32 {
+        self.confidence_threshold
+    }
+
     // ── Dirty-frame fast path ─────────────────
 
     pub fn is_frame_dirty(&mut self, frame: &Frame) -> bool {
         let current: Vec<(u8, u8, u8)> = self.sentinel_coords.iter()
-            .map(|&(x, y)| frame_pixel_safe(frame, x, y))
+            .map(|&(x, y)| pixel_safe(frame, x, y))
             .collect();
         if current == self.last_sentinel_colors {
             return false;
@@ -150,7 +176,7 @@ impl BoardReader {
     // ── Public entry point ────────────────────
 
     pub fn read_state(&self, frame: &Frame) -> Result<GameState> {
-        let board         = self.read_board(frame);
+        let (board, vision_confidence) = self.read_board(frame);
         let current_piece = self.detect_current_piece(&board);
         let hold_piece    = self.read_hold_piece(frame);
         let next_queue    = self.read_next_queue(frame);
@@ -163,63 +189,66 @@ impl BoardReader {
             next_queue,
             is_active,
             incoming_garbage: 0,
+            vision_confidence,
         })
     }
 
     // ── Board reading ─────────────────────────
 
-    /// Sample all 200 cells using multi-point voting.
-    fn read_board(&self, frame: &Frame) -> [[CellColor; 10]; 20] {
+    /// Read all 200 cells via 5-point voting.  Returns board + confidence score.
+    ///
+    /// Confidence = fraction of non-empty cells where ≥ 3 of 5 samples agreed.
+    /// Returns 1.0 on an empty board (nothing to be wrong about).
+    fn read_board(&self, frame: &Frame) -> ([[CellColor; 10]; 20], f32) {
         let mut board = [[CellColor::Empty; 10]; 20];
+        let mut non_empty = 0u32;
+        let mut strong    = 0u32; // non-empty cells with votes >= 3
+
         for row in 0..20 {
             for col in 0..10 {
                 let (cx, cy) = self.cell_coords[row * 10 + col];
-                board[row][col] = self.sample_cell(frame, cx, cy, self.cell_size);
+                let (color, votes) = self.sample_cell_votes(frame, cx, cy, self.cell_size);
+                board[row][col] = color;
+
+                if color != CellColor::Empty {
+                    non_empty += 1;
+                    if votes >= 3 {
+                        strong += 1;
+                    } else {
+                        // Log uncertain cell so calibration issues show up in the log file
+                        let (r, g, b) = frame.pixel_rgb(cx, cy);
+                        let (h, s, v) = rgb_to_hsv(r, g, b);
+                        tracing::debug!(
+                            "Low-confidence cell [{row},{col}]: {:?} \
+                             ({votes}/5 votes) RGB({r},{g},{b}) HSV({h:.0},{s:.2},{v:.2})",
+                            color,
+                        );
+                    }
+                }
             }
         }
-        board
+
+        let confidence = if non_empty == 0 {
+            1.0f32
+        } else {
+            strong as f32 / non_empty as f32
+        };
+
+        (board, confidence)
     }
 
     /// Sample a cell at 5 points (center + NESW at ±cell_size/4) and majority-vote.
-    ///
-    /// Requires at least 2 of 5 samples to agree on the same non-Empty color
-    /// before declaring it non-empty — filters single-pixel noise and border hits.
-    fn sample_cell(&self, frame: &Frame, cx: u32, cy: u32, cell_sz: u32) -> CellColor {
+    /// Returns (best_color, vote_count).  vote_count 0-5; must be ≥ 2 to classify non-empty.
+    fn sample_cell_votes(&self, frame: &Frame, cx: u32, cy: u32, cell_sz: u32) -> (CellColor, u8) {
         let off = (cell_sz / 4).max(4) as i32;
         let pts: [(i32, i32); 5] = [(0, 0), (-off, 0), (off, 0), (0, -off), (0, off)];
-
-        let mut counts = [0u8; 9]; // index = CellColor as u8
-        for &(dx, dy) in &pts {
-            let x = (cx as i32 + dx).clamp(0, frame.width  as i32 - 1) as u32;
-            let y = (cy as i32 + dy).clamp(0, frame.height as i32 - 1) as u32;
-            let (r, g, b) = frame.pixel_rgb(x, y);
-            let c = self.lut.classify(r, g, b);
-            counts[c as usize] = counts[c as usize].saturating_add(1);
-        }
-
-        // Find the non-Empty color with the highest vote count
-        let mut best_color = CellColor::Empty;
-        let mut best_count = 0u8;
-        for i in 1u8..9 { // skip 0 = Empty
-            if counts[i as usize] > best_count {
-                best_count = counts[i as usize];
-                best_color = u8_to_cell_color(i);
-            }
-        }
-
-        // Need at least 2/5 samples to agree — avoids single bad pixels
-        if best_count >= 2 { best_color } else { CellColor::Empty }
+        self.vote(frame, cx, cy, &pts, 2)
     }
 
     // ── Current piece detection ───────────────
 
-    /// Find the falling piece color by scanning rows from the top.
-    ///
-    /// The active piece always spawns at the top of the board (rows 0-3).
-    /// Scanning top-down means the first piece-color cell found is almost
-    /// certainly the falling piece, not locked stack cells.
     fn detect_current_piece(&self, board: &[[CellColor; 10]; 20]) -> Option<CellColor> {
-        // Priority: scan the spawn zone (top 4 rows) first.
+        // Spawn zone first (rows 0-3) — the active piece always appears here first
         for row in 0..4 {
             for col in 0..10 {
                 let c = board[row][col];
@@ -228,7 +257,7 @@ impl BoardReader {
                 }
             }
         }
-        // Piece may have fallen lower — scan the rest of the board.
+        // Fallen lower — scan rest of board
         for row in 4..20 {
             for col in 0..10 {
                 let c = board[row][col];
@@ -242,14 +271,9 @@ impl BoardReader {
 
     // ── Hold piece reading ────────────────────
 
-    /// Read the hold piece using a 3×3 grid of sample points around (hold_x, hold_y).
-    ///
-    /// TETR.IO renders the hold piece in a small preview box. Sampling a grid
-    /// rather than a single center pixel tolerates slight coordinate offsets and
-    /// edge cases where the center lands on a piece border or background.
     fn read_hold_piece(&self, frame: &Frame) -> Option<CellColor> {
-        let color = self.sample_region_vote(frame, self.hold_x, self.hold_y, 8);
-        if color != CellColor::Empty { Some(color) } else { None }
+        let (c, _) = self.sample_region(frame, self.hold_x, self.hold_y, 8);
+        if c != CellColor::Empty { Some(c) } else { None }
     }
 
     // ── Next queue reading ────────────────────
@@ -257,25 +281,36 @@ impl BoardReader {
     fn read_next_queue(&self, frame: &Frame) -> Vec<CellColor> {
         self.next_positions.iter()
             .filter_map(|&(x, y)| {
-                let c = self.sample_region_vote(frame, x, y, 8);
+                let (c, _) = self.sample_region(frame, x, y, 8);
                 if c != CellColor::Empty { Some(c) } else { None }
             })
             .collect()
     }
 
-    // ── Shared sampling helper ────────────────
+    // ── Shared multi-point sampling ───────────
 
-    /// Sample 9 points in a 3×3 grid with the given spacing offset and majority-vote.
-    /// Returns Empty if no piece color reaches 2+ votes.
-    fn sample_region_vote(&self, frame: &Frame, cx: u32, cy: u32, off: i32) -> CellColor {
+    /// Sample a 3×3 grid at the given offset spacing and return (best_color, vote_count).
+    fn sample_region(&self, frame: &Frame, cx: u32, cy: u32, off: i32) -> (CellColor, u8) {
         let pts: [(i32, i32); 9] = [
             (-off, -off), (0, -off), (off, -off),
             (-off,    0), (0,    0), (off,    0),
             (-off,  off), (0,  off), (off,  off),
         ];
+        self.vote(frame, cx, cy, &pts, 2)
+    }
 
-        let mut counts = [0u8; 9];
-        for &(dx, dy) in &pts {
+    /// Core voting function: sample each offset point, tally CellColor votes,
+    /// return (winning_non_empty_color, its_vote_count) or (Empty, empty_count)
+    /// if no non-empty color reaches `min_votes`.
+    fn vote(
+        &self,
+        frame: &Frame,
+        cx: u32, cy: u32,
+        offsets: &[(i32, i32)],
+        min_votes: u8,
+    ) -> (CellColor, u8) {
+        let mut counts = [0u8; 9]; // index = CellColor as u8
+        for &(dx, dy) in offsets {
             let x = (cx as i32 + dx).clamp(0, frame.width  as i32 - 1) as u32;
             let y = (cy as i32 + dy).clamp(0, frame.height as i32 - 1) as u32;
             let (r, g, b) = frame.pixel_rgb(x, y);
@@ -285,28 +320,29 @@ impl BoardReader {
 
         let mut best_color = CellColor::Empty;
         let mut best_count = 0u8;
-        for i in 1u8..9 {
+        for i in 1u8..9 { // skip 0 = Empty
             if counts[i as usize] > best_count {
                 best_count = counts[i as usize];
                 best_color = u8_to_cell_color(i);
             }
         }
 
-        if best_count >= 2 { best_color } else { CellColor::Empty }
+        if best_count >= min_votes {
+            (best_color, best_count)
+        } else {
+            (CellColor::Empty, counts[0])
+        }
     }
 
     // ── Game active detection ─────────────────
 
     fn detect_game_active(&self, board: &[[CellColor; 10]; 20]) -> bool {
-        // Look for at least 4 non-empty cells — one complete tetromino.
         let mut filled = 0u32;
         for row in board {
             for &cell in row {
                 if cell != CellColor::Empty {
                     filled += 1;
-                    if filled >= 4 {
-                        return true;
-                    }
+                    if filled >= 4 { return true; }
                 }
             }
         }
@@ -318,44 +354,40 @@ impl BoardReader {
 //  Helpers
 // ─────────────────────────────────────────────
 
-fn frame_pixel_safe(frame: &Frame, x: u32, y: u32) -> (u8, u8, u8) {
-    if x < frame.width && y < frame.height {
-        frame.pixel_rgb(x, y)
-    } else {
-        (0, 0, 0)
-    }
+fn pixel_safe(frame: &Frame, x: u32, y: u32) -> (u8, u8, u8) {
+    if x < frame.width && y < frame.height { frame.pixel_rgb(x, y) } else { (0, 0, 0) }
 }
 
 #[inline(always)]
 fn u8_to_cell_color(i: u8) -> CellColor {
     match i {
-        1 => CellColor::I,
-        2 => CellColor::O,
-        3 => CellColor::T,
-        4 => CellColor::S,
-        5 => CellColor::Z,
-        6 => CellColor::J,
-        7 => CellColor::L,
-        8 => CellColor::Garbage,
+        1 => CellColor::I, 2 => CellColor::O, 3 => CellColor::T,
+        4 => CellColor::S, 5 => CellColor::Z, 6 => CellColor::J,
+        7 => CellColor::L, 8 => CellColor::Garbage,
         _ => CellColor::Empty,
     }
 }
 
 // ─────────────────────────────────────────────
-//  Color classification (LUT seed function)
+//  Color classification
 // ─────────────────────────────────────────────
 
-/// HSV-based classifier — called only at startup to populate the LUT.
+/// Classify a single RGB pixel to a CellColor.
 ///
-/// Key thresholds:
-/// - `brightness < 30`  → too dark, Empty
-/// - `v < 0.35`         → ghost piece filter: TETR.IO renders the ghost piece at
-///                         ~25-35% opacity over a dark background. Real locked
-///                         pieces are V > 0.6. Ghost pieces land in V ≈ 0.15-0.40.
-///                         Treating them as Empty gives Cold Clear a clean board.
-/// - `s < 0.22`         → low saturation = gray = Garbage (if bright) or Empty
-/// - hue ranges         → piece identification (calibrated from default TETR.IO skin)
-fn classify_color_slow(r: u8, g: u8, b: u8) -> CellColor {
+/// This function is called only at startup to populate the LUT.  After that
+/// all classification goes through the O(1) LUT lookup.
+///
+/// # Thresholds (calibrated against TETR.IO default skin, 1920×1080 BW)
+///
+/// | Filter           | Threshold | Reason                                       |
+/// |------------------|-----------|----------------------------------------------|
+/// | brightness < 30  | → Empty   | Truly dark background pixels                 |
+/// | HSV value < 0.35 | → Empty   | Ghost-piece filter: TETR.IO renders the drop |
+/// |                  |           | shadow at ~25-35% opacity.  Real locked       |
+/// |                  |           | pieces are V > 0.60; ghost pieces ≈ 0.15-0.40|
+/// | saturation < 0.22| → Garbage | Low-chroma = gray/white = garbage or border   |
+/// |                  |    or Empty|                                               |
+pub fn classify_rgb(r: u8, g: u8, b: u8) -> CellColor {
     let brightness = (r as u16 + g as u16 + b as u16) / 3;
     if brightness < 30 {
         return CellColor::Empty;
@@ -363,13 +395,13 @@ fn classify_color_slow(r: u8, g: u8, b: u8) -> CellColor {
 
     let (h, s, v) = rgb_to_hsv(r, g, b);
 
-    // Ghost-piece filter: dim but hue-correct pixels are the ghost overlay,
-    // not real locked cells. Filter before the saturation check.
+    // Ghost-piece filter: dim hue-correct pixels are the ghost overlay,
+    // not real locked cells.  Must come before the saturation check.
     if v < 0.35 {
         return CellColor::Empty;
     }
 
-    // Low saturation = achromatic = garbage or background
+    // Low saturation = achromatic = garbage lines or UI background
     if s < 0.22 {
         return if brightness > 80 { CellColor::Garbage } else { CellColor::Empty };
     }
@@ -387,7 +419,7 @@ fn classify_color_slow(r: u8, g: u8, b: u8) -> CellColor {
     }
 }
 
-fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     let r = r as f32 / 255.0;
     let g = g as f32 / 255.0;
     let b = b as f32 / 255.0;
