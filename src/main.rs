@@ -4,6 +4,7 @@ mod ai;
 mod config;
 mod overlay;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
@@ -61,9 +62,13 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
     state.set_status("Stopped");
 
     let target_frame_time = std::time::Duration::from_millis(1000 / cfg.capture.target_fps as u64);
-    let mut last_board: Option<[[vision::CellColor; 10]; 20]> = None;
     let mut waiting_for_move = false;
     let mut waiting_since: Option<std::time::Instant> = None;
+    // Track the current piece type so we only compute AI once per new piece spawn.
+    let mut locked_piece: Option<vision::CellColor> = None;
+    // Pre-computed placements for upcoming queue pieces. Populated by AI prefetch.
+    // On piece spawn: cache hit → show ghost instantly, no "Thinking..." delay.
+    let mut prefetch_cache: HashMap<vision::CellColor, ai::OverlayPlacement> = HashMap::new();
 
     loop {
         let frame_start = std::time::Instant::now();
@@ -74,8 +79,9 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
             state.enabled.store(!was_enabled, Ordering::Relaxed);
             if !was_enabled {
                 state.paused.store(false, Ordering::Relaxed);
-                last_board = None;
                 waiting_for_move = false;
+                locked_piece = None;
+                prefetch_cache.clear();
                 *state.current_suggestion.lock().unwrap() = None;
                 // Reset AI engine so stale blocked workers don't linger
                 if let Err(e) = ai_engine.reset() {
@@ -84,6 +90,8 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
                 state.set_status("Running");
                 info!("ESP STARTED");
             } else {
+                locked_piece = None;
+                prefetch_cache.clear();
                 *state.current_suggestion.lock().unwrap() = None;
                 state.set_status("Stopped");
                 info!("ESP STOPPED");
@@ -107,12 +115,18 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
             continue;
         }
 
-        // === Poll for completed AI suggestion (non-blocking) ===
+        // === Drain prefetch results into cache (always, even while waiting) ===
+        for (color, placement) in ai_engine.drain_prefetch() {
+            debug!("Prefetch cached: {:?}", color);
+            prefetch_cache.insert(color, placement);
+        }
+
+        // === Poll for completed primary AI suggestion (non-blocking) ===
         if waiting_for_move {
             if let Some(suggestion) = ai_engine.poll_move() {
                 waiting_for_move = false;
                 waiting_since = None;
-                debug!("AI suggestion ready: direct={:?}", suggestion.direct.cells);
+                debug!("Primary suggestion ready: direct={:?}", suggestion.direct.cells);
                 *state.current_suggestion.lock().unwrap() = Some(suggestion);
             } else if let Some(since) = waiting_since {
                 // Timeout: if AI hasn't responded in 5 seconds, give up and allow resubmission
@@ -158,20 +172,40 @@ fn run_bot(state: Arc<BotState>, cfg: config::BotConfig) {
         debug!("Vision: {vision_ms:.2}ms");
 
         if !game_state.is_active || game_state.current_piece.is_none() {
+            // No active piece — clear lock so next piece spawn triggers AI
+            if locked_piece.is_some() {
+                locked_piece = None;
+                debug!("Piece gone — lock cleared, ready for next spawn");
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         }
 
-        // === Submit to AI if board changed (non-blocking) ===
-        let board_changed = last_board.as_ref().map_or(true, |prev| *prev != game_state.board);
+        // === Detect new piece spawn ===
+        // Only submit to AI when the current piece TYPE changes (new piece spawned).
+        // Once locked, we keep showing the same suggestion until the piece is placed.
+        let cur_piece = game_state.current_piece;
+        let is_new_piece = locked_piece != cur_piece;
 
-        if board_changed && !waiting_for_move {
-            last_board = Some(game_state.board);
-            // Keep old suggestion visible until new one arrives (no clearing)
+        if is_new_piece && !waiting_for_move {
+            locked_piece = cur_piece;
+
+            // Check prefetch cache — if we already computed this piece, show it instantly.
+            if let Some(piece_color) = cur_piece {
+                if let Some(cached_placement) = prefetch_cache.remove(&piece_color) {
+                    debug!("Prefetch cache hit for {:?} — instant display", piece_color);
+                    *state.current_suggestion.lock().unwrap() = Some(ai::AiSuggestion {
+                        direct: cached_placement,
+                        hold_option: None, // hold option will arrive from primary shortly
+                    });
+                }
+            }
+
+            // Always submit primary computation: refreshes with current board + computes hold option.
             ai_engine.submit(&game_state);
             waiting_for_move = true;
             waiting_since = Some(std::time::Instant::now());
-            debug!("Submitted new state to AI");
+            debug!("New piece spawned ({:?}) — submitting primary AI request", cur_piece);
         }
 
         let elapsed = frame_start.elapsed();

@@ -12,8 +12,14 @@ use libtetris::{Board, MovementMode, Piece};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::panic;
 use crate::config::AiConfig;
 use crate::vision::{CellColor, GameState};
+
+/// Maximum number of next pieces to feed Cold Clear.
+/// Cold Clear uses internal ArrayVecs with limited capacity; feeding too many pieces
+/// (especially with speculate=true) can cause a panic.
+const MAX_NEXT_PIECES: usize = 5;
 
 /// A single recommended placement (position + piece color).
 #[derive(Debug, Clone)]
@@ -168,6 +174,8 @@ struct AiRequest {
 pub struct AiEngine {
     req_tx: mpsc::Sender<AiRequest>,
     resp_rx: mpsc::Receiver<AiSuggestion>,
+    /// Pre-computed placements for upcoming queue pieces (piece color → direct placement).
+    prefetch_rx: mpsc::Receiver<(CellColor, OverlayPlacement)>,
     cancel: Arc<AtomicBool>,
     options: cold_clear::Options,
     weights: cold_clear::evaluation::Standard,
@@ -227,6 +235,7 @@ impl AiEngine {
         let cancel = Arc::new(AtomicBool::new(false));
         let (req_tx, req_rx) = mpsc::channel::<AiRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<AiSuggestion>();
+        let (prefetch_tx, prefetch_rx) = mpsc::channel::<(CellColor, OverlayPlacement)>();
 
         let opts = options.clone();
         let wts = weights.clone();
@@ -235,13 +244,14 @@ impl AiEngine {
         std::thread::Builder::new()
             .name("ai-worker".into())
             .spawn(move || {
-                ai_worker(opts, wts, req_rx, resp_tx, cancel_flag);
+                ai_worker(opts, wts, req_rx, resp_tx, prefetch_tx, cancel_flag);
             })
             .context("Failed to spawn AI worker thread")?;
 
         Ok(Self {
             req_tx,
             resp_rx,
+            prefetch_rx,
             cancel,
             options,
             weights,
@@ -257,6 +267,7 @@ impl AiEngine {
         let cancel = Arc::new(AtomicBool::new(false));
         let (req_tx, req_rx) = mpsc::channel::<AiRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<AiSuggestion>();
+        let (prefetch_tx, prefetch_rx) = mpsc::channel::<(CellColor, OverlayPlacement)>();
 
         let opts = self.options.clone();
         let wts = self.weights.clone();
@@ -265,12 +276,13 @@ impl AiEngine {
         std::thread::Builder::new()
             .name("ai-worker".into())
             .spawn(move || {
-                ai_worker(opts, wts, req_rx, resp_tx, cancel_flag);
+                ai_worker(opts, wts, req_rx, resp_tx, prefetch_tx, cancel_flag);
             })
             .context("Failed to spawn AI worker thread")?;
 
         self.req_tx = req_tx;
         self.resp_rx = resp_rx;
+        self.prefetch_rx = prefetch_rx;
         self.cancel = cancel;
 
         tracing::info!("AI engine reset — fresh worker spawned");
@@ -284,14 +296,24 @@ impl AiEngine {
         });
     }
 
-    /// Poll for a completed suggestion. Non-blocking — returns None if AI is still thinking.
+    /// Poll for a completed primary suggestion. Non-blocking.
     pub fn poll_move(&mut self) -> Option<AiSuggestion> {
         self.resp_rx.try_recv().ok()
+    }
+
+    /// Drain all completed prefetch results. Returns (piece_color, direct_placement) pairs.
+    /// Call every frame to populate the prefetch cache.
+    pub fn drain_prefetch(&mut self) -> Vec<(CellColor, OverlayPlacement)> {
+        let mut out = Vec::new();
+        while let Ok(pair) = self.prefetch_rx.try_recv() {
+            out.push(pair);
+        }
+        out
     }
 }
 
 /// Compute the best placement for a given piece on a given board using Cold Clear.
-/// Returns None if cancelled or Cold Clear finds no valid move.
+/// Returns None if cancelled, Cold Clear finds no valid move, or Cold Clear panics.
 fn compute_placement(
     board: &Board,
     piece: Piece,
@@ -301,54 +323,94 @@ fn compute_placement(
     weights: &cold_clear::evaluation::Standard,
     cancel: &AtomicBool,
 ) -> Option<OverlayPlacement> {
-    let interface = cold_clear::Interface::launch(
-        board.clone(),
-        options.clone(),
-        weights.clone(),
-        None,
-    );
+    // Limit queue size to avoid ArrayVec capacity overflow inside Cold Clear
+    let capped_queue: Vec<Piece> = next_queue.iter().copied().take(MAX_NEXT_PIECES).collect();
 
-    interface.add_next_piece(piece);
-    for &p in next_queue {
-        interface.add_next_piece(p);
-    }
-    interface.suggest_next_move(garbage);
+    // Wrap in catch_unwind to survive Cold Clear panics (arrayvec overflow, etc.)
+    let board_clone = board.clone();
+    let opts = options.clone();
+    let wts = weights.clone();
 
-    // Poll instead of blocking — allows cancellation.
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let interface = cold_clear::Interface::launch(
+            board_clone,
+            opts,
+            wts,
+            None,
+        );
+
+        interface.add_next_piece(piece);
+        for &p in &capped_queue {
+            interface.add_next_piece(p);
         }
-        match interface.poll_next_move() {
-            Ok((mv, _info)) => {
-                let cells_lt = mv.expected_location.cells();
-                let cells_vision = cells_lt.map(|(col, row_lt)| (col, 19 - row_lt));
-                let placed_piece = mv.expected_location.kind.0;
-                return Some(OverlayPlacement {
-                    cells: cells_vision,
-                    piece_color: piece_to_color(placed_piece),
-                });
-            }
-            Err(cold_clear::BotPollState::Waiting) => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(cold_clear::BotPollState::Dead) => {
+        interface.suggest_next_move(garbage);
+
+        // Poll instead of blocking — allows cancellation.
+        loop {
+            if cancel.load(Ordering::Relaxed) {
                 return None;
             }
+            match interface.poll_next_move() {
+                Ok((mv, _info)) => {
+                    let cells_lt = mv.expected_location.cells();
+                    let cells_vision = cells_lt.map(|(col, row_lt)| (col, 19 - row_lt));
+                    let placed_piece = mv.expected_location.kind.0;
+                    return Some(OverlayPlacement {
+                        cells: cells_vision,
+                        piece_color: piece_to_color(placed_piece),
+                    });
+                }
+                Err(cold_clear::BotPollState::Waiting) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(cold_clear::BotPollState::Dead) => {
+                    return None;
+                }
+            }
+        }
+    }));
+
+    match result {
+        Ok(placement) => placement,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown panic".to_string()
+            };
+            tracing::error!("Cold Clear panicked: {msg}");
+            None
         }
     }
 }
 
-/// Background worker: receives game states, computes both direct and hold placements.
+/// Background worker: receives game states, computes primary result immediately,
+/// then prefetches placements for upcoming queue pieces in the background.
 fn ai_worker(
     options: cold_clear::Options,
     weights: cold_clear::evaluation::Standard,
     rx: mpsc::Receiver<AiRequest>,
-    tx: mpsc::Sender<AiSuggestion>,
+    resp_tx: mpsc::Sender<AiSuggestion>,
+    prefetch_tx: mpsc::Sender<(CellColor, OverlayPlacement)>,
     cancel: Arc<AtomicBool>,
 ) {
-    while let Ok(req) = rx.recv() {
-        // Drain to latest request (skip stale ones)
+    // Stash a new request that arrived while we were prefetching.
+    let mut pending: Option<AiRequest> = None;
+
+    loop {
+        // Get next request — either one stashed during prefetch, or wait on channel.
+        let req = if let Some(p) = pending.take() {
+            p
+        } else {
+            match rx.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            }
+        };
+
+        // Drain to latest primary request (skip stale ones)
         let mut latest = req;
         while let Ok(newer) = rx.try_recv() {
             latest = newer;
@@ -358,12 +420,11 @@ fn ai_worker(
             break;
         }
 
-        let state = &latest.state;
+        let state = latest.state.clone();
 
         // Build board field from vision data (exclude falling piece)
         let field = build_field_from_vision(&state.board, state.current_piece);
 
-        // Log what vision sees
         let next_names: Vec<&str> = state.next_queue.iter()
             .filter_map(|c| piece_name(*c))
             .collect();
@@ -376,11 +437,9 @@ fn ai_worker(
             filled,
         );
 
-        // Build base board
         let mut board = Board::new();
         board.set_field(field);
 
-        // Collect next queue as Piece values
         let next_pieces: Vec<Piece> = state.next_queue.iter()
             .filter_map(|c| color_to_piece(*c))
             .collect();
@@ -392,7 +451,7 @@ fn ai_worker(
 
         let garbage = state.incoming_garbage;
 
-        // === Compute direct placement (current piece, no hold) ===
+        // === 1. Direct placement (current piece) ===
         let direct = match compute_placement(
             &board, current_piece, &next_pieces, garbage,
             &options, &weights, &cancel,
@@ -405,62 +464,64 @@ fn ai_worker(
             }
         };
 
-        tracing::info!(
-            "Direct placement: piece={:?} cells={:?}",
-            direct.piece_color, direct.cells,
-        );
+        tracing::debug!("Direct placement: piece={:?} cells={:?}", direct.piece_color, direct.cells);
 
-        // Check for cancellation / new request before computing hold option
         if cancel.load(Ordering::Relaxed) { break; }
-        if rx.try_recv().is_ok() {
-            // New request arrived — skip hold computation, we'll redo everything
-            // Put the request back... actually we can't un-recv. Just continue the loop.
-            // The new request will be picked up on the next iteration.
-            // For now, send the direct-only result.
-            let _ = tx.send(AiSuggestion {
-                direct,
-                hold_option: None,
-            });
-            continue;
-        }
 
-        // === Compute hold placement (hold piece on same board) ===
-        let hold_option = if let Some(hold_color) = state.hold_piece {
-            if let Some(hold_piece) = color_to_piece(hold_color) {
-                // When user holds: hold piece becomes current, current piece goes to hold.
-                // Next queue for the hold computation is: current_piece + original next queue
-                // (because after holding, the old current piece is in hold, not in queue)
-                let mut hold_next = vec![current_piece];
-                hold_next.extend_from_slice(&next_pieces);
+        // === 2. Hold placement ===
+        let hold_option = if let Some(hold_piece) = state.hold_piece.and_then(color_to_piece) {
+            // After holding: hold piece becomes current; current piece goes to back of hold.
+            // Simulate queue: [current_piece] + original_next (capped)
+            let mut hold_next = vec![current_piece];
+            hold_next.extend(next_pieces.iter().copied().take(MAX_NEXT_PIECES - 1));
 
-                match compute_placement(
-                    &board, hold_piece, &hold_next, garbage,
-                    &options, &weights, &cancel,
-                ) {
-                    Some(p) => {
-                        tracing::info!(
-                            "Hold placement: piece={:?} cells={:?}",
-                            p.piece_color, p.cells,
-                        );
-                        Some(p)
-                    }
-                    None => {
-                        if cancel.load(Ordering::Relaxed) { break; }
-                        tracing::warn!("Cold Clear returned no hold move");
-                        None
-                    }
+            match compute_placement(&board, hold_piece, &hold_next, garbage, &options, &weights, &cancel) {
+                Some(p) => {
+                    tracing::debug!("Hold placement: piece={:?} cells={:?}", p.piece_color, p.cells);
+                    Some(p)
                 }
-            } else {
-                None
+                None => {
+                    if cancel.load(Ordering::Relaxed) { break; }
+                    None
+                }
             }
         } else {
             None
         };
 
-        let _ = tx.send(AiSuggestion {
-            direct,
-            hold_option,
-        });
+        // Send primary result immediately so overlay can display it right away.
+        let _ = resp_tx.send(AiSuggestion { direct, hold_option });
+        tracing::info!("Primary suggestion sent");
+
+        // === 3. Prefetch for next queue pieces ===
+        // Compute direct placements for next[0], next[1], next[2] while current piece is
+        // still falling. When those pieces spawn, their ghost can appear instantly.
+        //
+        // Uses the same locked board (current piece not yet placed) — a slight approximation
+        // but good enough for instant visual feedback before primary refines it.
+        for i in 0..next_pieces.len().min(3) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            // If a new primary request arrived, stash it and stop prefetching.
+            if let Ok(new_req) = rx.try_recv() {
+                pending = Some(new_req);
+                break;
+            }
+
+            let pf_piece = next_pieces[i];
+            // Each successive prefetch uses a shorter lookahead (pieces after it in queue)
+            let pf_next: Vec<Piece> = next_pieces.iter().skip(i + 1).copied().collect();
+
+            if let Some(placement) = compute_placement(
+                &board, pf_piece, &pf_next, garbage, &options, &weights, &cancel,
+            ) {
+                tracing::debug!("Prefetch[{i}]: piece={:?} cells={:?}", placement.piece_color, placement.cells);
+                let _ = prefetch_tx.send((piece_to_color(pf_piece), placement));
+            }
+
+            if cancel.load(Ordering::Relaxed) { break; }
+        }
     }
     tracing::info!("AI worker exiting");
 }
